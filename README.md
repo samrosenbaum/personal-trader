@@ -1,77 +1,103 @@
 # Personal Trader
 
-Crypto portfolio analyzer and trading recommendation engine. Connects to your exchange accounts, reads charts across multiple timeframes, detects patterns, analyzes sentiment, and tells you when to buy, sell, move to USDC, hedge with futures, or trade options.
+Crypto and stock portfolio analyzer that connects to your **Robinhood** and **Coinbase** accounts (plus other exchanges), reads charts across multiple timeframes, and tells you exactly what you can do with what you hold to make money -- whether markets are going up or crashing.
 
 ## Features
 
-- **Multi-exchange portfolio tracking** - Binance, Coinbase, Kraken, Bybit
-- **Technical analysis** - 40+ indicators (RSI, MACD, Bollinger, Ichimoku, ADX, etc.) across multiple timeframes (15m, 1h, 4h, 1d)
-- **Chart pattern recognition** - Double top/bottom, head & shoulders, triangles, flags, candlestick patterns (doji, hammer, engulfing, morning/evening star)
-- **Support & resistance detection** - Automated pivot-based level clustering
-- **Market sentiment** - Fear & Greed Index, funding rates, market cap trends, trending coins
-- **Trading signals** - Composite scoring from technicals + patterns + sentiment with specific buy/sell/hold recommendations
-- **Derivatives advisor** - Futures hedging, put buying (crash protection), put selling (income), funding rate arbitrage
-- **Portfolio risk management** - Concentration analysis, volatility tracking, diversification scoring, position sizing
-- **Continuous monitoring** - Background scanner with configurable interval and alerts
-- **Alerts** - Console, Telegram, and Discord notifications for urgent signals
+- **Robinhood integration** - Pulls your full portfolio: crypto, stocks, ETFs, options, cash balance, P&L
+- **Coinbase + exchange support** - Binance, Coinbase, Kraken, Bybit via API
+- **"What can I do with what I hold?"** - The `opportunities` command analyzes every position and gives you specific, step-by-step actions
+- **Technical analysis** - 40+ indicators (RSI, MACD, Bollinger, Ichimoku, ADX, etc.) across multiple timeframes
+- **Chart pattern recognition** - Double top/bottom, head & shoulders, triangles, flags, candlestick patterns
+- **Market sentiment** - Fear & Greed Index, funding rates, market cap trends
+- **Derivatives advisor** - When to hedge with futures, buy puts for crash protection, sell puts for income
+- **Portfolio risk management** - Concentration analysis, volatility tracking, diversification scoring
+- **Continuous monitoring** - Background scanner with Telegram and Discord alerts
 
 ## Quick Start
 
 ```bash
-# Clone and install
+# Install
 cd personal-trader
 pip install -e .
 
-# Configure API keys
+# Configure your accounts
 cp .env.example .env
-# Edit .env with your exchange API keys
+# Edit .env -- at minimum set ROBINHOOD_USERNAME and ROBINHOOD_PASSWORD
+# For Coinbase, add COINBASE_API_KEY and COINBASE_SECRET
 
-# Run commands
-trader scan              # One-time market scan
-trader analyze BTC       # Deep analysis of Bitcoin
-trader portfolio         # View your portfolio + risk
-trader signals           # All trading signals
-trader derivatives BTC   # Futures/options strategies
-trader sentiment         # Market sentiment dashboard
-trader watch             # Continuous monitoring
-trader config            # View configuration
+# See everything you hold
+trader portfolio
+
+# The main event: what should I do with my holdings?
+trader opportunities
+
+# Deep-dive into a specific asset
+trader analyze BTC
+trader analyze ETH
+
+# Market scan
+trader scan
+
+# Continuous monitoring
+trader watch
 ```
+
+## Setting Up Robinhood
+
+1. Add your Robinhood credentials to `.env`:
+   ```
+   ROBINHOOD_USERNAME=your_email@example.com
+   ROBINHOOD_PASSWORD=your_password
+   ```
+
+2. For automatic 2FA (recommended):
+   - In Robinhood app: Settings > Security > Two-Factor Authentication
+   - Choose "Authentication App"
+   - Instead of scanning the QR code, tap "Can't scan?" to reveal the secret key
+   - Copy that base32 string and add to `.env`:
+   ```
+   ROBINHOOD_TOTP_SECRET=JBSWY3DPEHPK3PXP
+   ```
+   - Then scan the QR code with your authenticator app as well (so you have a backup)
+
+3. Without the TOTP secret, Robinhood may send SMS codes which require manual entry.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `trader scan` | Scan all watched symbols, show trading signals |
-| `trader scan -s SOL/USDT` | Scan with additional symbols |
+| `trader portfolio` | Full portfolio view: Robinhood crypto/stocks/options + exchange holdings + risk analysis |
+| `trader opportunities` | **The big one**: analyzes every position and tells you what to do to make money |
+| `trader scan` | Scan watchlist symbols, show trading signals |
+| `trader analyze BTC` | Deep technical analysis for a specific asset |
+| `trader signals` | Top trading signals across all watched assets |
+| `trader derivatives BTC` | Futures and options strategy recommendations |
+| `trader sentiment` | Fear & Greed index, market overview, funding rates |
 | `trader watch` | Continuous monitoring loop with alerts |
-| `trader watch -i 60` | Watch with 60-second scan interval |
-| `trader portfolio` | Portfolio breakdown + risk analysis |
-| `trader analyze BTC` | Deep technical analysis for BTC |
-| `trader analyze ETH -q USDC` | Analyze ETH/USDC pair |
-| `trader signals` | Show top trading signals across watchlist |
-| `trader derivatives BTC` | Derivatives strategy recommendations |
-| `trader sentiment` | Fear & greed, market overview, funding rates |
-| `trader config` | Show current configuration |
+| `trader config` | Show current configuration (keys masked) |
 
-## Signal Types
+## Opportunity Types
 
-The system generates these recommendation types:
+The `opportunities` command looks at each position you hold and generates specific ideas:
 
-| Signal | Meaning |
-|--------|---------|
-| **STRONG BUY** | Multiple bullish signals aligned across timeframes |
-| **BUY** | Bullish bias, good entry conditions |
-| **HOLD** | No clear direction, maintain current position |
-| **SELL** | Bearish signals, reduce exposure |
-| **STRONG SELL** | Multiple bearish signals, exit recommended |
-| **MOVE TO STABLECOIN** | Risk-off: convert to USDC to protect capital |
-| **HEDGE WITH FUTURES** | Open short futures to protect long spot positions |
-| **BUY PUTS** | Purchase put options for crash protection |
-| **SELL PUTS** | Sell puts for premium income (fearful markets) |
+| Opportunity | When It Triggers | What It Tells You |
+|-------------|-----------------|-------------------|
+| **TAKE PROFIT** | RSI overbought + you're in profit | Sell X% at current price, set trailing stop on rest |
+| **CUT LOSS** | Bearish trend + you're down >15% | Sell to stop bleeding, re-enter on reversal |
+| **RIDE THE TREND** | Bullish trend + healthy momentum | Hold, set trailing stop, add on pullbacks |
+| **BUY THE DIP** | RSI oversold + no confirmed downtrend | Add to position at discount |
+| **ROTATE TO USDC** | Greed/euphoria + overbought + large position | Take chips off table, buy back after correction |
+| **HEDGE WITH FUTURES** | MACD bearish + large position | Short futures to protect spot without selling |
+| **SELL COVERED CALLS** | Holding at profit + not oversold | Sell calls above current price for income |
+| **BUY PUTS** | Euphoric market + large position | Insurance against crash for a small premium |
+| **SELL CASH-SECURED PUTS** | Fear market + you have cash | Collect premium; if assigned, buy at discount |
+| **REBALANCE** | Single position exceeds risk limit | Trim to bring back within allocation limits |
+| **DCA ACCUMULATE** | Fear/capitulation market | Dollar-cost average into quality assets at a discount |
 
 ## How It Works
 
-### Signal Generation
+### Signal Scoring
 
 Signals are generated from three weighted layers:
 
@@ -79,16 +105,15 @@ Signals are generated from three weighted layers:
 2. **Chart Patterns (25%)** - Classical patterns weighted by confidence
 3. **Market Sentiment (25%)** - Fear & Greed (contrarian), funding rates, market cap trends
 
-Each layer produces a score from -100 to +100. The weighted composite determines the action.
+### Risk Profiles
 
-### Risk Management
+| Profile | Max Single Position | Min Stablecoins | Max Leverage |
+|---------|-------------------|-----------------|-------------|
+| Conservative | 15% | 30% | 1x |
+| Moderate | 25% | 15% | 2x |
+| Aggressive | 40% | 5% | 5x |
 
-Portfolio risk is assessed on:
-- Single position concentration vs risk profile limits
-- Stablecoin allocation (cash buffer)
-- Portfolio-level volatility (correlation-adjusted)
-- Diversification (Herfindahl index)
-- Per-asset drawdown tracking
+Set with `RISK_PROFILE=moderate` in `.env`.
 
 ### Derivatives Strategy
 
@@ -98,38 +123,31 @@ The advisor recommends derivatives when:
 - **Sell puts**: Fear < 30 with bullish technicals (collect elevated premium)
 - **Funding arbitrage**: |funding rate| > 0.05% (delta-neutral carry trade)
 
-## Configuration
+## Supported Platforms
 
-Edit `.env` to configure:
-
-- **Exchange API keys** - Read-only keys recommended for scanning
-- **Risk profile** - `conservative`, `moderate`, or `aggressive`
-- **Scan interval** - Seconds between continuous scans
-- **Alert channels** - Telegram bot token/chat ID, Discord webhook
-- **Paper trading** - Set `true` to disable any trade execution
-
-## Supported Exchanges
-
-| Exchange | Spot | Futures | Options |
-|----------|------|---------|---------|
-| Binance | Yes | Yes | Yes |
-| Coinbase | Yes | No | No |
-| Kraken | Yes | Yes | No |
-| Bybit | Yes | Yes | No |
+| Platform | Crypto | Stocks | Options | Futures |
+|----------|--------|--------|---------|---------|
+| **Robinhood** | Yes | Yes | Yes (read) | No |
+| Coinbase | Yes | No | No | No |
+| Binance | Yes | No | Yes | Yes |
+| Kraken | Yes | No | No | Yes |
+| Bybit | Yes | No | No | Yes |
 
 ## Architecture
 
 ```
 personal_trader/
-  config.py              # Settings from .env
-  cli.py                 # Click CLI commands + Rich dashboard
+  config.py              # Settings from .env (Robinhood + exchanges)
+  cli.py                 # CLI commands + Rich dashboard
   exchanges/
-    manager.py           # Multi-exchange connection via ccxt
+    robinhood.py         # Robinhood connector (robin_stocks)
+    manager.py           # Multi-source portfolio aggregation
   analysis/
     technical.py         # 40+ indicators on OHLCV data
     patterns.py          # Chart pattern detection
     sentiment.py         # Fear/greed, funding, market overview
   strategy/
+    opportunities.py     # "What can I do with what I hold?"
     signals.py           # Composite signal generator
     risk.py              # Portfolio risk + position sizing
     derivatives.py       # Futures/options strategy advisor
@@ -137,3 +155,10 @@ personal_trader/
     scanner.py           # Continuous market scanner
     alerts.py            # Telegram/Discord alert dispatch
 ```
+
+## Important Notes
+
+- This tool is **read-only** by default. It does not place trades on your behalf.
+- `PAPER_TRADING=true` is the default. No real trades will be executed.
+- Robinhood credentials are stored locally in your `.env` file. Never commit this file.
+- All recommendations are informational. This is not financial advice. Do your own research.

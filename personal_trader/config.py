@@ -22,6 +22,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Robinhood
+    robinhood_username: str = ""
+    robinhood_password: str = ""
+    robinhood_totp_secret: str = ""  # base32 secret for 2FA (from authenticator app setup)
+
     # Exchange keys
     binance_api_key: str = ""
     binance_secret: str = ""

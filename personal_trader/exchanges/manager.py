@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Portfolio:
-    """Snapshot of holdings across all exchanges."""
+    """Snapshot of holdings across all exchanges and brokers."""
 
     balances: dict[str, float] = field(default_factory=dict)
     total_usd: float = 0.0
@@ -31,11 +31,13 @@ class Portfolio:
 
 
 class ExchangeManager:
-    """Manages connections to multiple crypto exchanges."""
+    """Manages connections to crypto exchanges and Robinhood."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.exchanges: dict[str, ccxt.Exchange] = {}
+        self._robinhood = None  # lazy-loaded
+        self._robinhood_portfolio = None  # cached per session
         self._init_exchanges()
 
     def _init_exchanges(self) -> None:
@@ -76,10 +78,33 @@ class ExchangeManager:
         if not self.exchanges:
             logger.warning("No exchanges connected. Using public data only.")
 
+    def _get_robinhood(self):
+        """Lazy-load the Robinhood connector."""
+        if self._robinhood is None and self.settings.robinhood_username:
+            from personal_trader.exchanges.robinhood import RobinhoodConnector
+
+            self._robinhood = RobinhoodConnector(self.settings)
+        return self._robinhood
+
+    def get_robinhood_portfolio(self):
+        """Fetch Robinhood portfolio (cached within session)."""
+        rh = self._get_robinhood()
+        if rh is None:
+            return None
+        if self._robinhood_portfolio is None:
+            self._robinhood_portfolio = rh.get_portfolio()
+        return self._robinhood_portfolio
+
+    def refresh_robinhood(self):
+        """Force refresh of Robinhood portfolio cache."""
+        self._robinhood_portfolio = None
+        return self.get_robinhood_portfolio()
+
     def get_portfolio(self) -> Portfolio:
-        """Fetch combined portfolio from all connected exchanges."""
+        """Fetch combined portfolio from all connected exchanges and Robinhood."""
         portfolio = Portfolio()
 
+        # --- Crypto exchanges via ccxt ---
         for name, exchange in self.exchanges.items():
             try:
                 balance = exchange.fetch_balance()
@@ -95,6 +120,21 @@ class ExchangeManager:
                 portfolio.exchange_breakdown[name] = exchange_balances
             except Exception as e:
                 logger.error(f"Error fetching balance from {name}: {e}")
+
+        # --- Robinhood ---
+        rh_portfolio = self.get_robinhood_portfolio()
+        if rh_portfolio:
+            rh_balances: dict[str, float] = {}
+            for h in rh_portfolio.crypto_holdings:
+                portfolio.balances[h.symbol] = portfolio.balances.get(h.symbol, 0) + h.market_value
+                rh_balances[h.symbol] = rh_balances.get(h.symbol, 0) + h.market_value
+            for h in rh_portfolio.stock_holdings:
+                portfolio.balances[h.symbol] = portfolio.balances.get(h.symbol, 0) + h.market_value
+                rh_balances[h.symbol] = rh_balances.get(h.symbol, 0) + h.market_value
+            if rh_portfolio.cash_balance > 0:
+                portfolio.balances["USD"] = portfolio.balances.get("USD", 0) + rh_portfolio.cash_balance
+                rh_balances["USD"] = rh_portfolio.cash_balance
+            portfolio.exchange_breakdown["robinhood"] = rh_balances
 
         portfolio.total_usd = sum(portfolio.balances.values())
         return portfolio

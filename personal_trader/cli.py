@@ -1,13 +1,14 @@
 """CLI interface for the personal trader.
 
 Commands:
-    trader scan          - Run a single market scan
-    trader watch         - Start continuous monitoring
-    trader portfolio     - View portfolio breakdown and risk
-    trader analyze BTC   - Deep analysis of a specific asset
-    trader signals       - Show latest trading signals
-    trader derivatives   - Show derivatives strategy recommendations
-    trader config        - Show current configuration
+    trader scan            - Run a single market scan
+    trader watch           - Start continuous monitoring
+    trader portfolio       - View portfolio breakdown and risk (Robinhood + exchanges)
+    trader opportunities   - What can I do with what I hold to make money?
+    trader analyze BTC     - Deep analysis of a specific asset
+    trader signals         - Show latest trading signals
+    trader derivatives     - Show derivatives strategy recommendations
+    trader config          - Show current configuration
 """
 
 from __future__ import annotations
@@ -175,31 +176,135 @@ def watch(interval: int | None) -> None:
 
 @main.command()
 def portfolio() -> None:
-    """View portfolio breakdown and risk analysis."""
+    """View portfolio breakdown and risk analysis (Robinhood + exchanges)."""
     from personal_trader.strategy.risk import RiskManager
 
     settings, em, scanner = _get_components()
 
-    console.print(Panel("Fetching portfolio...", style="bold cyan"))
+    console.print(Panel("Fetching portfolio from all sources...", style="bold cyan"))
     pf = em.get_portfolio()
 
     if pf.total_usd == 0:
-        console.print("[yellow]No portfolio data. Check your API keys in .env[/yellow]")
+        console.print("[yellow]No portfolio data. Check your API keys / Robinhood credentials in .env[/yellow]")
         return
 
-    # Allocation table
-    table = Table(title=f"Portfolio (${pf.total_usd:,.2f})")
-    table.add_column("Asset", style="bold")
-    table.add_column("Value (USD)", justify="right")
-    table.add_column("Allocation %", justify="right")
+    # --- Source breakdown ---
+    if len(pf.exchange_breakdown) > 1 or "robinhood" in pf.exchange_breakdown:
+        src_table = Table(title="Portfolio by Source")
+        src_table.add_column("Source", style="bold")
+        src_table.add_column("Value", justify="right")
+        src_table.add_column("% of Total", justify="right")
+
+        for source, balances in sorted(
+            pf.exchange_breakdown.items(),
+            key=lambda x: sum(x[1].values()),
+            reverse=True,
+        ):
+            source_total = sum(balances.values())
+            pct = (source_total / pf.total_usd * 100) if pf.total_usd > 0 else 0
+            label = source.title()
+            src_table.add_row(label, f"${source_total:,.2f}", f"{pct:.1f}%")
+
+        src_table.add_row("", "", "")
+        src_table.add_row("[bold]TOTAL[/bold]", f"[bold]${pf.total_usd:,.2f}[/bold]", "[bold]100%[/bold]")
+        console.print(src_table)
+        console.print()
+
+    # --- Robinhood detail (crypto, stocks, options) ---
+    rh_portfolio = em.get_robinhood_portfolio()
+    if rh_portfolio and rh_portfolio.total_equity > 0:
+        # Crypto
+        if rh_portfolio.crypto_holdings:
+            crypto_table = Table(title="Robinhood Crypto")
+            crypto_table.add_column("Asset", style="bold")
+            crypto_table.add_column("Qty", justify="right")
+            crypto_table.add_column("Avg Cost", justify="right")
+            crypto_table.add_column("Price", justify="right")
+            crypto_table.add_column("Value", justify="right")
+            crypto_table.add_column("P&L", justify="right")
+
+            for h in sorted(rh_portfolio.crypto_holdings, key=lambda x: x.market_value, reverse=True):
+                pnl_color = "green" if h.unrealized_pnl >= 0 else "red"
+                crypto_table.add_row(
+                    h.symbol,
+                    f"{h.quantity:.6f}",
+                    f"${h.avg_cost:,.2f}",
+                    f"${h.current_price:,.2f}",
+                    f"${h.market_value:,.2f}",
+                    Text(f"{h.unrealized_pnl_pct:+.1f}%", style=pnl_color),
+                )
+            console.print(crypto_table)
+            console.print()
+
+        # Stocks
+        if rh_portfolio.stock_holdings:
+            stock_table = Table(title="Robinhood Stocks & ETFs")
+            stock_table.add_column("Symbol", style="bold")
+            stock_table.add_column("Qty", justify="right")
+            stock_table.add_column("Avg Cost", justify="right")
+            stock_table.add_column("Price", justify="right")
+            stock_table.add_column("Value", justify="right")
+            stock_table.add_column("P&L", justify="right")
+
+            for h in sorted(rh_portfolio.stock_holdings, key=lambda x: x.market_value, reverse=True):
+                pnl_color = "green" if h.unrealized_pnl >= 0 else "red"
+                stock_table.add_row(
+                    h.symbol,
+                    f"{h.quantity:.2f}",
+                    f"${h.avg_cost:,.2f}",
+                    f"${h.current_price:,.2f}",
+                    f"${h.market_value:,.2f}",
+                    Text(f"{h.unrealized_pnl_pct:+.1f}%", style=pnl_color),
+                )
+            console.print(stock_table)
+            console.print()
+
+        # Options
+        if rh_portfolio.option_positions:
+            opt_table = Table(title="Robinhood Options")
+            opt_table.add_column("Underlying", style="bold")
+            opt_table.add_column("Type", justify="center")
+            opt_table.add_column("Strike", justify="right")
+            opt_table.add_column("Exp", justify="center")
+            opt_table.add_column("Qty", justify="right")
+            opt_table.add_column("Value", justify="right")
+            opt_table.add_column("P&L", justify="right")
+
+            for o in rh_portfolio.option_positions:
+                pnl_color = "green" if o.unrealized_pnl >= 0 else "red"
+                type_color = "green" if o.option_type == "call" else "red"
+                opt_table.add_row(
+                    o.symbol,
+                    Text(f"{o.direction} {o.option_type}".upper(), style=type_color),
+                    f"${o.strike:,.2f}",
+                    o.expiration,
+                    f"{o.quantity:.0f}",
+                    f"${o.market_value:,.2f}",
+                    Text(f"${o.unrealized_pnl:+,.2f}", style=pnl_color),
+                )
+            console.print(opt_table)
+            console.print()
+
+        # Cash
+        if rh_portfolio.cash_balance > 0:
+            console.print(f"Robinhood cash: ${rh_portfolio.cash_balance:,.2f}")
+            console.print()
+
+    # --- Combined allocation ---
+    alloc_table = Table(title=f"Combined Allocation (${pf.total_usd:,.2f})")
+    alloc_table.add_column("Asset", style="bold")
+    alloc_table.add_column("Value (USD)", justify="right")
+    alloc_table.add_column("Allocation %", justify="right")
+    alloc_table.add_column("Source(s)")
 
     for asset, pct in sorted(pf.allocation.items(), key=lambda x: x[1], reverse=True):
         val = pf.balances.get(asset, 0)
-        table.add_row(asset, f"${val:,.2f}", f"{pct:.1f}%")
+        sources = [src for src, bals in pf.exchange_breakdown.items() if asset in bals]
+        alloc_table.add_row(asset, f"${val:,.2f}", f"{pct:.1f}%", ", ".join(s.title() for s in sources))
 
-    console.print(table)
+    console.print(alloc_table)
 
-    # Risk analysis
+    # --- Risk analysis ---
     risk_mgr = RiskManager(settings.risk_profile)
     report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd)
 
@@ -228,6 +333,201 @@ def portfolio() -> None:
         console.print("\n[bold cyan]Suggestions:[/bold cyan]")
         for s in report.suggestions:
             console.print(f"  > {s}")
+
+
+# ---------------------------------------------------------------------------
+# opportunities
+# ---------------------------------------------------------------------------
+
+
+OPP_COLORS = {
+    "ride_the_trend": "green",
+    "take_profit": "bold yellow",
+    "rotate_to_usdc": "bold magenta",
+    "hedge_with_futures": "cyan",
+    "buy_puts": "magenta",
+    "sell_covered_calls": "blue",
+    "sell_cash_secured_puts": "blue",
+    "buy_the_dip": "bold green",
+    "cut_loss": "bold red",
+    "rebalance": "yellow",
+    "dca_accumulate": "green",
+    "funding_arbitrage": "cyan",
+}
+
+
+@main.command()
+def opportunities() -> None:
+    """What can I do with what I hold to make money?
+
+    Analyzes every position in your portfolio (Robinhood + exchanges)
+    and tells you exactly what actions you can take based on charts,
+    sentiment, and your risk profile.
+    """
+    from personal_trader.analysis.technical import compute_multi_timeframe
+    from personal_trader.strategy.opportunities import OpportunitiesEngine
+    from personal_trader.strategy.risk import STABLECOINS
+
+    settings, em, scanner = _get_components()
+
+    console.print(Panel(
+        "Scanning your holdings and charts to find money-making opportunities...",
+        style="bold cyan",
+    ))
+
+    # 1. Gather all holdings from everywhere
+    pf = em.get_portfolio()
+    rh_portfolio = em.get_robinhood_portfolio()
+
+    if pf.total_usd == 0:
+        console.print("[yellow]No portfolio data. Configure Robinhood or exchange API keys in .env[/yellow]")
+        return
+
+    # Build unified holdings list with metadata
+    holdings = []
+    cash_total = 0.0
+
+    # Robinhood holdings (with cost basis and P&L)
+    if rh_portfolio:
+        for h in rh_portfolio.crypto_holdings:
+            holdings.append({
+                "symbol": h.symbol,
+                "value": h.market_value,
+                "quantity": h.quantity,
+                "avg_cost": h.avg_cost,
+                "current_price": h.current_price,
+                "unrealized_pnl_pct": h.unrealized_pnl_pct,
+                "asset_type": "crypto",
+                "source": "robinhood",
+            })
+        for h in rh_portfolio.stock_holdings:
+            holdings.append({
+                "symbol": h.symbol,
+                "value": h.market_value,
+                "quantity": h.quantity,
+                "avg_cost": h.avg_cost,
+                "current_price": h.current_price,
+                "unrealized_pnl_pct": h.unrealized_pnl_pct,
+                "asset_type": h.asset_type,
+                "source": "robinhood",
+            })
+        cash_total += rh_portfolio.cash_balance
+
+    # Exchange holdings
+    for source, balances in pf.exchange_breakdown.items():
+        if source == "robinhood":
+            continue  # already handled above
+        for asset, value in balances.items():
+            if asset.upper() in STABLECOINS or asset == "USD":
+                cash_total += value
+            else:
+                # Merge with existing holding if from another source
+                existing = next((h for h in holdings if h["symbol"] == asset), None)
+                if existing:
+                    existing["value"] += value
+                else:
+                    holdings.append({
+                        "symbol": asset,
+                        "value": value,
+                        "quantity": 0,
+                        "avg_cost": 0,
+                        "current_price": 0,
+                        "unrealized_pnl_pct": 0,
+                        "asset_type": "crypto",
+                        "source": source,
+                    })
+
+    # Add cash as a holding for cash-based opportunities
+    if cash_total > 0:
+        holdings.append({
+            "symbol": "USD",
+            "value": cash_total,
+            "quantity": cash_total,
+            "avg_cost": 1,
+            "current_price": 1,
+            "unrealized_pnl_pct": 0,
+            "asset_type": "cash",
+            "source": "mixed",
+        })
+
+    # 2. Fetch chart data for each non-cash holding
+    console.print(f"Analyzing {len([h for h in holdings if h['asset_type'] != 'cash'])} positions...")
+    indicators_by_symbol = {}
+    for h in holdings:
+        sym = h["symbol"]
+        if sym == "USD" or sym.upper() in STABLECOINS:
+            continue
+        # For crypto, use USDT pair; for stocks, skip chart data (no ccxt data)
+        if h["asset_type"] in ("stock", "etf"):
+            continue  # stock chart data not available via ccxt
+        pair = f"{sym}/USDT"
+        try:
+            tf_data = compute_multi_timeframe(
+                fetch_fn=em.fetch_ohlcv,
+                symbol=pair,
+                timeframes=["1h", "4h", "1d"],
+            )
+            if tf_data:
+                indicators_by_symbol[sym] = tf_data
+        except Exception as e:
+            console.print(f"  [dim]Could not fetch chart data for {sym}: {e}[/dim]")
+
+    # 3. Get sentiment
+    sentiment = scanner.sentiment_analyzer.get_full_report()
+
+    # 4. Run the opportunities engine
+    engine = OpportunitiesEngine(settings.risk_profile)
+    report = engine.analyze_holdings(
+        holdings=holdings,
+        total_portfolio=pf.total_usd,
+        cash_available=cash_total,
+        indicators_by_symbol=indicators_by_symbol,
+        sentiment=sentiment,
+    )
+
+    # 5. Display
+    if not report.opportunities:
+        console.print("[green]No specific opportunities found at this time. Portfolio looks stable.[/green]")
+        return
+
+    console.print(f"\nMarket regime: [bold]{report.market_regime}[/bold]")
+    console.print(f"Found [bold]{len(report.opportunities)}[/bold] opportunities across your portfolio\n")
+
+    for i, opp in enumerate(report.by_priority, 1):
+        color = OPP_COLORS.get(opp.opp_type.value, "white")
+        priority_label = {1: "DO NOW", 2: "SOON", 3: "CONSIDER"}.get(opp.priority, "")
+        priority_color = {1: "bold red", 2: "yellow", 3: "dim"}.get(opp.priority, "white")
+
+        # Build the panel content
+        lines = []
+        if opp.current_value > 0:
+            lines.append(f"[bold]Position:[/bold] ${opp.current_value:,.0f} ({opp.allocation_pct:.1f}% of portfolio)")
+        if opp.unrealized_pnl_pct:
+            pnl_c = "green" if opp.unrealized_pnl_pct >= 0 else "red"
+            lines.append(f"[bold]Unrealized P&L:[/bold] [{pnl_c}]{opp.unrealized_pnl_pct:+.1f}%[/{pnl_c}]")
+        lines.append("")
+        lines.append(opp.details)
+        lines.append("")
+        lines.append("[bold]Steps:[/bold]")
+        for step in opp.action_steps:
+            lines.append(f"  1. {step}" if opp.action_steps.index(step) == 0 else f"  {opp.action_steps.index(step)+1}. {step}")
+        lines.append("")
+        lines.append(f"[bold]Potential gain:[/bold] {opp.potential_gain}")
+        lines.append(f"[bold]Risk:[/bold] {opp.risk}")
+        lines.append(f"[bold]Confidence:[/bold] {opp.confidence:.0%}")
+
+        title_str = (
+            f"[{priority_color}][{priority_label}][/{priority_color}] "
+            f"[{color}]{opp.opp_type.value.upper()}[/{color}] - {opp.symbol}"
+        )
+
+        console.print(Panel(
+            "\n".join(lines),
+            title=title_str,
+            subtitle=opp.headline,
+            style=color,
+        ))
+        console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +911,11 @@ def show_config() -> None:
     table.add_row("Paper Trading", str(settings.paper_trading))
     table.add_row("Alert Threshold", f"${settings.alert_threshold:,.0f}")
     table.add_row("", "")
-    table.add_row("Binance API", mask(settings.binance_api_key))
+    table.add_row("[bold]Robinhood[/bold]", mask(settings.robinhood_username))
+    table.add_row("Robinhood 2FA", "configured" if settings.robinhood_totp_secret else "[dim]not set[/dim]")
+    table.add_row("", "")
     table.add_row("Coinbase API", mask(settings.coinbase_api_key))
+    table.add_row("Binance API", mask(settings.binance_api_key))
     table.add_row("Kraken API", mask(settings.kraken_api_key))
     table.add_row("Bybit API", mask(settings.bybit_api_key))
     table.add_row("", "")
