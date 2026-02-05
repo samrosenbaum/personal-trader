@@ -9,6 +9,14 @@ into actionable trading signals with specific recommendations:
 - Hedge with futures (short)
 - Sell puts for income
 - Buy puts for crash protection
+
+Signal intelligence:
+- Uses support/resistance from pattern detection for stop/target placement
+- Multi-timeframe confluence scoring (signals on multiple TFs = higher confidence)
+- Market structure analysis (higher highs/lows or lower highs/lows)
+- Momentum divergence awareness (price vs indicators disagreement)
+- Volatility regime detection (compression vs expansion)
+- Order flow inference from volume profile and price action
 """
 
 from __future__ import annotations
@@ -21,7 +29,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from personal_trader.analysis.patterns import Bias, PatternReport
+from personal_trader.analysis.patterns import Bias, DetectedPattern, PatternReport, PatternType
 from personal_trader.analysis.sentiment import SentimentLevel, SentimentReport
 from personal_trader.config import RiskProfile
 
@@ -115,20 +123,45 @@ class SignalGenerator:
         pattern_score = self._score_patterns(patterns) if patterns else 0
         sentiment_score = self._score_sentiment(sentiment) if sentiment else 0
 
+        # Advanced analysis layers
+        confluence = self._multi_timeframe_confluence(indicators)
+        structure = self._market_structure(indicators)
+        vol_regime = self._volatility_regime(indicators)
+        divergence_adj = self._divergence_adjustment(indicators, patterns)
+
         # Weighted composite score (-100 to +100)
-        weights = {"technical": 0.50, "pattern": 0.25, "sentiment": 0.25}
+        # Base weights adjusted by confluence strength
+        weights = {"technical": 0.45, "pattern": 0.25, "sentiment": 0.20, "structure": 0.10}
         composite = (
             ta_scores["composite"] * weights["technical"]
             + pattern_score * weights["pattern"]
             + sentiment_score * weights["sentiment"]
+            + structure["score"] * weights["structure"]
         )
+
+        # Apply modifiers from advanced analysis
+        # Confluence: if multiple timeframes agree, amplify the signal
+        composite *= confluence["amplifier"]
+
+        # Divergence: if price/indicator divergence detected, shift toward reversal
+        composite += divergence_adj
+
+        # Volatility regime: in compression, reduce confidence; in expansion, signals matter more
+        vol_conf_modifier = vol_regime["confidence_modifier"]
+
+        composite = max(-100, min(100, composite))
 
         # Determine primary action
         action, urgency, confidence = self._score_to_action(composite, ta_scores, sentiment)
-        reasons = self._build_reasons(ta_scores, pattern_score, sentiment_score, patterns, sentiment)
+        confidence = min(confidence * vol_conf_modifier, 0.95)
 
-        # Calculate entry/stop/target from technical levels
-        entry, stop, target = self._compute_levels(indicators, action)
+        reasons = self._build_reasons(
+            ta_scores, pattern_score, sentiment_score, patterns, sentiment,
+            confluence=confluence, structure=structure, vol_regime=vol_regime,
+        )
+
+        # Calculate entry/stop/target from S/R levels + technicals
+        entry, stop, target = self._compute_levels(indicators, action, patterns)
 
         primary = Signal(
             symbol=symbol,
@@ -436,31 +469,360 @@ class SignalGenerator:
         return signals
 
     def _compute_levels(
-        self, indicators: dict[str, pd.DataFrame], action: Action
+        self,
+        indicators: dict[str, pd.DataFrame],
+        action: Action,
+        patterns: PatternReport | None = None,
     ) -> tuple[float | None, float | None, float | None]:
-        """Compute entry, stop-loss, and take-profit prices."""
-        # Use the highest-resolution available timeframe for levels
-        for tf in ("1h", "4h", "1d", "15m"):
-            if tf in indicators and not indicators[tf].empty:
-                df = indicators[tf]
-                last = df.iloc[-1]
-                close = float(last["close"])
-                atr = float(last.get("atr_14", close * 0.02))
+        """Compute entry, stop-loss, and take-profit using S/R levels + ATR.
 
-                if action in (Action.BUY, Action.STRONG_BUY):
-                    entry = close
-                    stop = close - (atr * 2)
-                    target = close + (atr * 3)
-                    return round(entry, 2), round(stop, 2), round(target, 2)
-                elif action in (Action.SELL, Action.STRONG_SELL, Action.MOVE_TO_STABLE):
-                    entry = close
-                    stop = close + (atr * 2)
-                    target = close - (atr * 3)
-                    return round(entry, 2), round(stop, 2), round(target, 2)
+        Priority for stop/target placement:
+        1. Nearest support/resistance from pattern detection
+        2. Key moving averages (50, 100, 200 SMA)
+        3. Bollinger Band extremes
+        4. ATR-based fallback
+        """
+        for tf in ("4h", "1h", "1d", "15m"):
+            if tf not in indicators or indicators[tf].empty:
+                continue
+            df = indicators[tf]
+            last = df.iloc[-1]
+            close = float(last["close"])
+            atr = float(last.get("atr_14", close * 0.02))
+
+            if action not in (
+                Action.BUY, Action.STRONG_BUY,
+                Action.SELL, Action.STRONG_SELL, Action.MOVE_TO_STABLE,
+            ):
+                return close, None, None
+
+            is_long = action in (Action.BUY, Action.STRONG_BUY)
+
+            # Gather candidate levels from S/R, MAs, BBands
+            support_levels = []
+            resistance_levels = []
+
+            if patterns:
+                support_levels.extend(patterns.support_levels)
+                resistance_levels.extend(patterns.resistance_levels)
+                # Also use pattern target prices
+                for p in patterns.patterns:
+                    if p.target_price:
+                        if p.target_price < close:
+                            support_levels.append(p.target_price)
+                        else:
+                            resistance_levels.append(p.target_price)
+
+            # Add moving averages as dynamic S/R
+            for ma_col in ("sma_50", "sma_100", "sma_200", "ema_50", "ema_200"):
+                if ma_col in df.columns:
+                    val = last.get(ma_col)
+                    if val and not pd.isna(val):
+                        fval = float(val)
+                        if fval < close:
+                            support_levels.append(fval)
+                        else:
+                            resistance_levels.append(fval)
+
+            # Add Bollinger Bands
+            if "bb_lower" in df.columns and not pd.isna(last.get("bb_lower")):
+                support_levels.append(float(last["bb_lower"]))
+            if "bb_upper" in df.columns and not pd.isna(last.get("bb_upper")):
+                resistance_levels.append(float(last["bb_upper"]))
+
+            # Add VWAP
+            if "vwap" in df.columns and not pd.isna(last.get("vwap")):
+                vwap = float(last["vwap"])
+                if vwap < close:
+                    support_levels.append(vwap)
                 else:
-                    return close, None, None
+                    resistance_levels.append(vwap)
+
+            # Filter and sort
+            support_below = sorted([s for s in support_levels if s < close], reverse=True)
+            resistance_above = sorted([r for r in resistance_levels if r > close])
+
+            entry = close
+
+            if is_long:
+                # Stop below nearest support (with ATR buffer)
+                if support_below:
+                    stop = support_below[0] - atr * 0.5
+                else:
+                    stop = close - atr * 2
+
+                # Target at nearest resistance (or 2nd if first is too close)
+                if resistance_above:
+                    target = resistance_above[0]
+                    # If first resistance is <1 ATR away, aim for the next one
+                    if target - close < atr and len(resistance_above) > 1:
+                        target = resistance_above[1]
+                else:
+                    target = close + atr * 3
+            else:
+                # Short: stop above nearest resistance
+                if resistance_above:
+                    stop = resistance_above[0] + atr * 0.5
+                else:
+                    stop = close + atr * 2
+
+                # Target at nearest support
+                if support_below:
+                    target = support_below[0]
+                    if close - target < atr and len(support_below) > 1:
+                        target = support_below[1]
+                else:
+                    target = close - atr * 3
+
+            # Sanity: ensure minimum 1:1.5 risk:reward
+            risk = abs(close - stop)
+            reward = abs(target - close)
+            if risk > 0 and reward / risk < 1.5:
+                if is_long:
+                    target = close + risk * 2
+                else:
+                    target = close - risk * 2
+
+            return round(entry, 2), round(stop, 2), round(target, 2)
 
         return None, None, None
+
+    # ------------------------------------------------------------------
+    # Advanced analysis methods
+    # ------------------------------------------------------------------
+
+    def _multi_timeframe_confluence(self, indicators: dict[str, pd.DataFrame]) -> dict:
+        """Check if multiple timeframes agree on direction.
+
+        When 15m, 1h, 4h, and 1d all say the same thing, that's a much
+        stronger signal than a single timeframe.
+        """
+        bullish_count = 0
+        bearish_count = 0
+        total = 0
+        tf_signals = {}
+
+        for tf, df in indicators.items():
+            if df is None or df.empty:
+                continue
+            total += 1
+            last = df.iloc[-1]
+            direction = 0
+
+            # MA alignment
+            if "sma_20" in df.columns and "sma_50" in df.columns:
+                sma20 = last.get("sma_20")
+                sma50 = last.get("sma_50")
+                close = last["close"]
+                if sma20 and sma50 and not pd.isna(sma20) and not pd.isna(sma50):
+                    if close > sma20 > sma50:
+                        direction += 1
+                    elif close < sma20 < sma50:
+                        direction -= 1
+
+            # MACD direction
+            if "macd_hist" in df.columns:
+                mh = last.get("macd_hist")
+                if mh and not pd.isna(mh):
+                    direction += 1 if mh > 0 else -1
+
+            # RSI zone
+            if "rsi_14" in df.columns:
+                rsi = last.get("rsi_14")
+                if rsi and not pd.isna(rsi):
+                    if rsi > 55:
+                        direction += 1
+                    elif rsi < 45:
+                        direction -= 1
+
+            if direction >= 2:
+                bullish_count += 1
+                tf_signals[tf] = "bullish"
+            elif direction <= -2:
+                bearish_count += 1
+                tf_signals[tf] = "bearish"
+            else:
+                tf_signals[tf] = "neutral"
+
+        if total == 0:
+            return {"amplifier": 1.0, "agreement": 0, "tf_signals": {}}
+
+        max_agree = max(bullish_count, bearish_count)
+        agreement_pct = max_agree / total
+
+        # Amplify signal when TFs agree: 3/4 agree = 1.2x, 4/4 = 1.4x
+        if agreement_pct >= 0.9:
+            amplifier = 1.4
+        elif agreement_pct >= 0.7:
+            amplifier = 1.2
+        elif agreement_pct >= 0.5:
+            amplifier = 1.0
+        else:
+            amplifier = 0.85  # disagreement = reduce conviction
+
+        return {
+            "amplifier": amplifier,
+            "agreement": agreement_pct,
+            "bullish_tfs": bullish_count,
+            "bearish_tfs": bearish_count,
+            "tf_signals": tf_signals,
+        }
+
+    def _market_structure(self, indicators: dict[str, pd.DataFrame]) -> dict:
+        """Analyze market structure: HH/HL (uptrend) vs LH/LL (downtrend).
+
+        This goes beyond simple MA positioning to understand the swing
+        structure of the market.
+        """
+        score = 0
+
+        # Use 4h or 1d for structure (need enough history)
+        for tf in ("4h", "1d"):
+            if tf not in indicators or indicators[tf].empty:
+                continue
+            df = indicators[tf]
+            if len(df) < 30:
+                continue
+
+            highs = df["high"].values
+            lows = df["low"].values
+
+            # Find swing highs and lows (local extremes with 5-bar window)
+            swing_highs = []
+            swing_lows = []
+            order = 5
+            for i in range(order, len(df) - order):
+                if highs[i] == max(highs[i - order: i + order + 1]):
+                    swing_highs.append(float(highs[i]))
+                if lows[i] == min(lows[i - order: i + order + 1]):
+                    swing_lows.append(float(lows[i]))
+
+            if len(swing_highs) < 2 or len(swing_lows) < 2:
+                continue
+
+            # Check last 3 swing highs/lows for structure
+            recent_highs = swing_highs[-3:]
+            recent_lows = swing_lows[-3:]
+
+            # Higher highs and higher lows = bullish structure
+            hh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] > recent_highs[i-1])
+            hl_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i-1])
+            # Lower highs and lower lows = bearish structure
+            lh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] < recent_highs[i-1])
+            ll_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] < recent_lows[i-1])
+
+            if hh_count >= 1 and hl_count >= 1:
+                score += 30  # bullish structure
+            elif lh_count >= 1 and ll_count >= 1:
+                score -= 30  # bearish structure
+
+            # Break of structure detection
+            current_price = float(df["close"].iloc[-1])
+            if swing_lows and current_price < swing_lows[-1]:
+                score -= 20  # broke below last swing low = structure break bearish
+            elif swing_highs and current_price > swing_highs[-1]:
+                score += 20  # broke above last swing high = structure break bullish
+
+            break  # only use best timeframe
+
+        return {"score": max(-100, min(100, score))}
+
+    def _volatility_regime(self, indicators: dict[str, pd.DataFrame]) -> dict:
+        """Detect if we're in a compression or expansion phase.
+
+        Compression (low vol): big move coming, but direction uncertain - lower confidence
+        Expansion (high vol): signals are playing out - higher confidence
+        """
+        for tf in ("4h", "1d", "1h"):
+            if tf not in indicators or indicators[tf].empty:
+                continue
+            df = indicators[tf]
+            last = df.iloc[-1]
+
+            squeeze = False
+            bb_width_percentile = 0.5
+            regime = "normal"
+
+            if "squeeze_on" in df.columns and last.get("squeeze_on"):
+                squeeze = True
+
+            if "bb_width" in df.columns and not pd.isna(last.get("bb_width")):
+                bb_w = last["bb_width"]
+                # Compare to rolling BB width
+                bb_widths = df["bb_width"].dropna()
+                if len(bb_widths) > 20:
+                    bb_width_percentile = float(
+                        (bb_widths < bb_w).sum() / len(bb_widths)
+                    )
+
+            if squeeze or bb_width_percentile < 0.2:
+                regime = "compression"
+                confidence_modifier = 0.85  # less confident, waiting for breakout
+            elif bb_width_percentile > 0.8:
+                regime = "expansion"
+                confidence_modifier = 1.1  # vol expansion = signals matter more
+            else:
+                regime = "normal"
+                confidence_modifier = 1.0
+
+            return {
+                "regime": regime,
+                "confidence_modifier": confidence_modifier,
+                "squeeze": squeeze,
+                "bb_width_percentile": bb_width_percentile,
+            }
+
+        return {"regime": "unknown", "confidence_modifier": 1.0, "squeeze": False, "bb_width_percentile": 0.5}
+
+    def _divergence_adjustment(
+        self, indicators: dict[str, pd.DataFrame], patterns: PatternReport | None,
+    ) -> float:
+        """Score adjustments based on price/indicator divergences.
+
+        Divergences (from pattern detection) and volume/price disagreements
+        are early warnings of reversals.
+        """
+        adj = 0.0
+
+        # Use divergences detected by pattern detector
+        if patterns:
+            for p in patterns.patterns:
+                if p.pattern == PatternType.BULLISH_DIVERGENCE:
+                    adj += 10 * p.confidence
+                elif p.pattern == PatternType.BEARISH_DIVERGENCE:
+                    adj -= 10 * p.confidence
+                elif p.pattern == PatternType.VOLUME_CLIMAX:
+                    # Volume climax = potential reversal
+                    if p.bias == Bias.BULLISH:
+                        adj += 8 * p.confidence
+                    else:
+                        adj -= 8 * p.confidence
+
+        # Check for OBV divergence (price up but OBV down, or vice versa)
+        for tf in ("4h", "1d"):
+            if tf not in indicators or indicators[tf].empty:
+                continue
+            df = indicators[tf]
+            if len(df) < 20 or "obv" not in df.columns:
+                continue
+
+            close_10 = df["close"].iloc[-10:]
+            obv_10 = df["obv"].iloc[-10:]
+
+            price_up = float(close_10.iloc[-1]) > float(close_10.iloc[0])
+            obv_up = float(obv_10.iloc[-1]) > float(obv_10.iloc[0])
+
+            if price_up and not obv_up:
+                adj -= 5  # price rising on declining volume = weak
+            elif not price_up and obv_up:
+                adj += 5  # price falling but accumulation happening = bullish divergence
+            break
+
+        return max(-20, min(20, adj))
+
+    # ------------------------------------------------------------------
+    # Reason building
+    # ------------------------------------------------------------------
 
     def _build_reasons(
         self,
@@ -469,6 +831,9 @@ class SignalGenerator:
         sentiment_score: float,
         patterns: PatternReport | None,
         sentiment: SentimentReport | None,
+        confluence: dict | None = None,
+        structure: dict | None = None,
+        vol_regime: dict | None = None,
     ) -> list[str]:
         """Build human-readable reasons for the signal."""
         reasons = []
@@ -483,14 +848,39 @@ class SignalGenerator:
 
         mom = ta_scores["momentum"]
         if mom > 15:
-            reasons.append(f"Bullish momentum (RSI/Stoch oversold recovery)")
+            reasons.append("Bullish momentum (RSI/Stoch oversold recovery)")
         elif mom < -15:
-            reasons.append(f"Bearish momentum (RSI/Stoch overbought)")
+            reasons.append("Bearish momentum (RSI/Stoch overbought)")
+
+        # Multi-timeframe confluence
+        if confluence and confluence.get("agreement", 0) >= 0.7:
+            bullish = confluence.get("bullish_tfs", 0)
+            bearish = confluence.get("bearish_tfs", 0)
+            if bullish > bearish:
+                reasons.append(f"Multi-timeframe confluence: {bullish} timeframes bullish")
+            elif bearish > bullish:
+                reasons.append(f"Multi-timeframe confluence: {bearish} timeframes bearish")
+
+        # Market structure
+        if structure and abs(structure.get("score", 0)) >= 20:
+            if structure["score"] > 0:
+                reasons.append("Market structure: higher highs and higher lows (uptrend)")
+            else:
+                reasons.append("Market structure: lower highs and lower lows (downtrend)")
+
+        # Volatility regime
+        if vol_regime:
+            regime = vol_regime.get("regime", "")
+            if regime == "compression":
+                reasons.append("Volatility compression (squeeze) - big move building")
+            elif regime == "expansion":
+                reasons.append("Volatility expanding - trend in motion")
 
         if patterns and patterns.patterns:
             top_patterns = sorted(patterns.patterns, key=lambda p: p.confidence, reverse=True)[:3]
             for p in top_patterns:
-                reasons.append(f"Pattern: {p.description}")
+                tag = " [CONFIRMED]" if p.confirmed else ""
+                reasons.append(f"Pattern: {p.description}{tag}")
 
         if sentiment and sentiment.fear_greed:
             fg = sentiment.fear_greed

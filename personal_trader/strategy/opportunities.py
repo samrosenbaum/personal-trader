@@ -7,15 +7,21 @@ For each holding it answers: "What can I do with THIS position RIGHT NOW
 to profit or protect myself?"
 
 Categories:
-  1. Ride the trend      - Hold / add, chart says momentum is in your favor
-  2. Take profit         - Chart says overbought, sell some into strength
-  3. Rotate to USDC      - Risk-off, convert to stablecoin and sit on sidelines
-  4. Hedge it            - Keep the position but open a futures short or buy puts
-  5. Sell covered calls   - Earn income on a stock/crypto you hold
+  1. Ride the trend         - Hold / add, chart says momentum is in your favor
+  2. Take profit            - Chart says overbought, sell some into strength
+  3. Rotate to USDC         - Risk-off, convert to stablecoin and sit on sidelines
+  4. Hedge it               - Keep the position but open a futures short or buy puts
+  5. Sell covered calls     - Earn income on a stock/crypto you hold
   6. Sell cash-secured puts - Use your cash to collect premium
-  7. Buy the dip          - Asset is oversold, add to your position
-  8. Cut the loss         - Stop loss triggered, cut it before it gets worse
-  9. Rebalance            - Position is too concentrated, trim and diversify
+  7. Buy the dip            - Asset is oversold, add to your position
+  8. Cut the loss           - Stop loss triggered, cut it before it gets worse
+  9. Rebalance              - Position is too concentrated, trim and diversify
+  10. Mean reversion play   - Price stretched far from moving averages, bet on snapback
+  11. Breakout trade         - Pattern breakout confirmed, ride the momentum
+  12. Volatility play        - Squeeze detected, straddle or position for expansion
+  13. Pair/rotation trade    - Relative strength shift: rotate from weak to strong
+  14. Funding rate harvest   - Collect funding payments on delta-neutral positions
+  15. Ladder scaling         - Scale in/out with price ladders at S/R levels
 """
 
 from __future__ import annotations
@@ -47,6 +53,10 @@ class OpportunityType(str, Enum):
     REBALANCE = "rebalance"
     DCA_ACCUMULATE = "dca_accumulate"
     FUNDING_ARBITRAGE = "funding_arbitrage"
+    MEAN_REVERSION = "mean_reversion"
+    BREAKOUT_TRADE = "breakout_trade"
+    VOLATILITY_PLAY = "volatility_play"
+    LADDER_SCALE = "ladder_scale"
 
 
 @dataclass
@@ -101,6 +111,7 @@ class OpportunitiesEngine:
         cash_available: float,
         indicators_by_symbol: dict[str, dict[str, pd.DataFrame]],
         sentiment: SentimentReport | None = None,
+        patterns_by_symbol: dict | None = None,
     ) -> OpportunitiesReport:
         """Generate opportunities for all holdings.
 
@@ -112,12 +123,14 @@ class OpportunitiesEngine:
             cash_available: cash/stablecoin available
             indicators_by_symbol: {symbol: {timeframe: DataFrame}}
             sentiment: current market sentiment
+            patterns_by_symbol: {symbol: PatternReport} from pattern detection
         """
         report = OpportunitiesReport(
             total_portfolio_value=total_portfolio,
             cash_available=cash_available,
         )
         report.market_regime = self._detect_regime(sentiment)
+        patterns_by_symbol = patterns_by_symbol or {}
 
         for holding in holdings:
             symbol = holding["symbol"]
@@ -133,8 +146,11 @@ class OpportunitiesEngine:
             if not tf_data:
                 continue
 
+            pattern_report = patterns_by_symbol.get(symbol)
+
             self._opportunities_for_position(
-                report, holding, alloc_pct, total_portfolio, tf_data, sentiment
+                report, holding, alloc_pct, total_portfolio, tf_data, sentiment,
+                pattern_report=pattern_report,
             )
 
         # Portfolio-level opportunities
@@ -166,6 +182,7 @@ class OpportunitiesEngine:
         total_portfolio: float,
         tf_data: dict[str, pd.DataFrame],
         sentiment: SentimentReport | None,
+        pattern_report=None,
     ) -> None:
         symbol = holding["symbol"]
         value = holding.get("value", 0)
@@ -175,6 +192,13 @@ class OpportunitiesEngine:
 
         # Get key indicator readings from best available timeframe
         signals = self._extract_signals(tf_data)
+
+        # --- BREAKOUT TRADE (confirmed pattern breakout) ---
+        if pattern_report and price and value > 200:
+            self._check_breakout_opportunities(
+                report, symbol, price, value, alloc_pct, pnl_pct,
+                total_portfolio, pattern_report, signals,
+            )
 
         # --- 1. TAKE PROFIT (overbought + profitable) ---
         if signals["rsi"] and signals["rsi"] > 70 and pnl_pct > 10:
@@ -448,6 +472,167 @@ class OpportunitiesEngine:
                 unrealized_pnl_pct=pnl_pct,
             ))
 
+        # --- 11. MEAN REVERSION (price stretched far from MAs) ---
+        dist_50 = signals.get("dist_sma_50_pct")
+        if dist_50 is not None and price:
+            # Price more than 15% above 50 SMA = overextended, likely to revert
+            if dist_50 > 15 and pnl_pct > 5:
+                sma50_val = signals.get("sma_50", price * 0.85)
+                report.opportunities.append(Opportunity(
+                    opp_type=OpportunityType.MEAN_REVERSION,
+                    symbol=symbol,
+                    headline=f"Mean reversion: {symbol} is {dist_50:.1f}% above 50 SMA",
+                    details=(
+                        f"{symbol} is stretched {dist_50:.1f}% above its 50-period SMA. "
+                        f"Price tends to revert toward the mean. This doesn't mean crash, "
+                        f"but pullbacks to the 50 SMA are high-probability. Consider "
+                        f"selling a portion into this overextension and buying back "
+                        f"near the 50 SMA (~${sma50_val:,.2f})."
+                    ),
+                    action_steps=[
+                        f"Sell 15-25% of {symbol} at current price (${price:,.2f})",
+                        f"Set buy-back order near 50 SMA at ~${sma50_val:,.2f}",
+                        f"If it continues higher, trail a stop at {dist_50/2:.0f}% above 50 SMA",
+                        f"Re-enter the full position on the pullback to the MA",
+                    ],
+                    potential_gain=f"Capture the {dist_50:.0f}% reversion to mean and re-buy cheaper",
+                    risk="Strong trend continues and you miss further upside on the sold portion",
+                    confidence=min(0.4 + dist_50 / 100, 0.75),
+                    priority=2,
+                    current_value=value,
+                    allocation_pct=alloc_pct,
+                    unrealized_pnl_pct=pnl_pct,
+                ))
+            # Price more than 15% below 50 SMA = oversold bounce opportunity
+            elif dist_50 < -15 and not signals["trend_bearish"]:
+                sma50_val = signals.get("sma_50", price * 1.15)
+                add_amount = total_portfolio * 0.03
+                report.opportunities.append(Opportunity(
+                    opp_type=OpportunityType.MEAN_REVERSION,
+                    symbol=symbol,
+                    headline=f"Mean reversion bounce: {symbol} is {abs(dist_50):.1f}% below 50 SMA",
+                    details=(
+                        f"{symbol} is {abs(dist_50):.1f}% below its 50 SMA, without being "
+                        f"in a confirmed downtrend. Mean reversion bounces from this level "
+                        f"typically deliver 8-15% moves. Add a small position targeting "
+                        f"the 50 SMA at ~${sma50_val:,.2f}."
+                    ),
+                    action_steps=[
+                        f"Buy ~${add_amount:,.0f} of {symbol} at current price",
+                        f"Set target near 50 SMA at ~${sma50_val:,.2f}",
+                        f"Stop loss at ${price * 0.92:,.2f} (8% below entry)",
+                        f"Take 50% off at 50 SMA, trail the rest",
+                    ],
+                    potential_gain=f"~{abs(dist_50):.0f}% bounce to 50 SMA (~${sma50_val:,.2f})",
+                    risk="Trend is actually breaking down; stop loss limits damage",
+                    confidence=min(0.4 + abs(dist_50) / 100, 0.7),
+                    priority=2,
+                    current_value=value,
+                    allocation_pct=alloc_pct,
+                    unrealized_pnl_pct=pnl_pct,
+                ))
+
+        # --- 12. VOLATILITY PLAY (squeeze detected) ---
+        if signals.get("squeeze") and price and value > 500:
+            atr = signals.get("atr", price * 0.02)
+            bb_upper = signals.get("bb_upper", price * 1.03)
+            bb_lower = signals.get("bb_lower", price * 0.97)
+            report.opportunities.append(Opportunity(
+                opp_type=OpportunityType.VOLATILITY_PLAY,
+                symbol=symbol,
+                headline=f"Volatility squeeze on {symbol} - big move building",
+                details=(
+                    f"{symbol} is in a Bollinger Band squeeze (BBands inside Keltner Channels). "
+                    f"This means volatility is at historic lows and a large move is imminent. "
+                    f"The direction isn't certain yet, but you can position for the breakout. "
+                    f"BB range: ${bb_lower:,.2f} - ${bb_upper:,.2f}."
+                ),
+                action_steps=[
+                    f"Watch for a breakout above ${bb_upper:,.2f} (bullish) or below ${bb_lower:,.2f} (bearish)",
+                    f"On bullish breakout: add to your {symbol} position (up to 5% of portfolio)",
+                    f"On bearish breakdown: hedge with a futures short or reduce position by 25%",
+                    f"Set alerts at both levels to catch the move",
+                    f"If already holding a large position, consider buying a cheap straddle (put + call)",
+                ],
+                potential_gain=f"Squeeze breakouts often deliver 2-3x ATR moves (${atr * 2:,.2f} - ${atr * 3:,.2f})",
+                risk="Fakeout breakout (false breakout that reverses); use stop losses",
+                confidence=0.55,
+                priority=2,
+                current_value=value,
+                allocation_pct=alloc_pct,
+                unrealized_pnl_pct=pnl_pct,
+            ))
+
+        # --- 13. LADDER SCALE (at S/R levels for better entries/exits) ---
+        if price and value > 1000 and signals.get("atr"):
+            atr = signals["atr"]
+            # Offer ladder scaling when position is meaningful
+            if pnl_pct > 20 and signals.get("rsi") and signals["rsi"] > 60:
+                # Scale out of profitable position at resistance levels
+                levels = [
+                    price * 1.05,
+                    price * 1.10,
+                    price * 1.18,
+                ]
+                report.opportunities.append(Opportunity(
+                    opp_type=OpportunityType.LADDER_SCALE,
+                    symbol=symbol,
+                    headline=f"Scale out of {symbol} at resistance levels - lock in {pnl_pct:.0f}% gain",
+                    details=(
+                        f"You're up {pnl_pct:.1f}% on {symbol}. Instead of selling all at once "
+                        f"or trying to time the top, set sell orders at ascending resistance "
+                        f"levels. This captures more upside if the rally continues while "
+                        f"guaranteeing you lock in some profit."
+                    ),
+                    action_steps=[
+                        f"Set limit sell for 30% of position at ${levels[0]:,.2f} (+5%)",
+                        f"Set limit sell for 30% of position at ${levels[1]:,.2f} (+10%)",
+                        f"Set limit sell for 20% of position at ${levels[2]:,.2f} (+18%)",
+                        f"Keep 20% as a runner with trailing stop at ${price * 0.90:,.2f}",
+                        f"Cancel unfilled orders if RSI drops below 45 (momentum lost)",
+                    ],
+                    potential_gain=f"Average exit ~8-12% above current if rally continues",
+                    risk="Price drops before filling orders; keep trailing stop as safety net",
+                    confidence=0.6,
+                    priority=2,
+                    current_value=value,
+                    allocation_pct=alloc_pct,
+                    unrealized_pnl_pct=pnl_pct,
+                ))
+            elif pnl_pct < -5 and signals.get("rsi") and signals["rsi"] < 45:
+                # Scale into a dip at support levels
+                levels = [
+                    price * 0.95,
+                    price * 0.90,
+                    price * 0.85,
+                ]
+                add_per_level = total_portfolio * 0.02
+                report.opportunities.append(Opportunity(
+                    opp_type=OpportunityType.LADDER_SCALE,
+                    symbol=symbol,
+                    headline=f"Ladder buy {symbol} at descending support levels",
+                    details=(
+                        f"{symbol} is pulling back ({pnl_pct:.1f}%). Instead of trying to "
+                        f"catch the exact bottom, place buy orders at descending support "
+                        f"levels. This gives you a better average price if it keeps dropping "
+                        f"and catches the bounce if it reverses."
+                    ),
+                    action_steps=[
+                        f"Set limit buy for ~${add_per_level:,.0f} at ${levels[0]:,.2f} (-5%)",
+                        f"Set limit buy for ~${add_per_level:,.0f} at ${levels[1]:,.2f} (-10%)",
+                        f"Set limit buy for ~${add_per_level:,.0f} at ${levels[2]:,.2f} (-15%)",
+                        f"Cancel all unfilled buys if price breaks below ${price * 0.80:,.2f} with volume",
+                        f"Overall stop loss at -20% from current to cap total risk",
+                    ],
+                    potential_gain=f"Better avg entry; catch the bounce from support",
+                    risk="Price drops through all levels (use the -20% hard stop)",
+                    confidence=0.5,
+                    priority=3,
+                    current_value=value,
+                    allocation_pct=alloc_pct,
+                    unrealized_pnl_pct=pnl_pct,
+                ))
+
     def _opportunities_for_cash(
         self,
         report: OpportunitiesReport,
@@ -552,15 +737,106 @@ class OpportunitiesEngine:
                 allocation_pct=cash_pct,
             ))
 
+    def _check_breakout_opportunities(
+        self,
+        report: OpportunitiesReport,
+        symbol: str,
+        price: float,
+        value: float,
+        alloc_pct: float,
+        pnl_pct: float,
+        total_portfolio: float,
+        pattern_report,
+        signals: dict,
+    ) -> None:
+        """Generate breakout trade opportunities from confirmed patterns."""
+        from personal_trader.analysis.patterns import PatternType, Bias
+
+        for pattern in pattern_report.patterns:
+            if not pattern.confirmed or pattern.confidence < 0.6:
+                continue
+
+            if pattern.bias == Bias.BULLISH and pattern.target_price and pattern.target_price > price:
+                upside_pct = (pattern.target_price - price) / price * 100
+                if upside_pct < 3:
+                    continue  # not enough upside
+
+                atr = signals.get("atr", price * 0.02)
+                stop = pattern.price_level - atr if pattern.price_level else price * 0.95
+
+                add_amount = total_portfolio * 0.03
+                report.opportunities.append(Opportunity(
+                    opp_type=OpportunityType.BREAKOUT_TRADE,
+                    symbol=symbol,
+                    headline=f"Bullish breakout on {symbol}: {pattern.pattern.value} confirmed",
+                    details=(
+                        f"A confirmed {pattern.pattern.value} pattern on {symbol} has broken "
+                        f"out. Measured target: ${pattern.target_price:,.2f} ({upside_pct:.1f}% upside). "
+                        f"Confidence: {pattern.confidence:.0%}. {pattern.description}"
+                    ),
+                    action_steps=[
+                        f"Add ~${add_amount:,.0f} to {symbol} at current price (${price:,.2f})",
+                        f"Set stop loss at ${stop:,.2f} (below breakout level)",
+                        f"Take profit target: ${pattern.target_price:,.2f}",
+                        f"Take 50% at target, trail the rest with a {atr/price*100:.1f}% trailing stop",
+                    ],
+                    potential_gain=f"~{upside_pct:.1f}% to measured move target (${pattern.target_price:,.2f})",
+                    risk=f"False breakout - stop loss at ${stop:,.2f} limits downside",
+                    confidence=pattern.confidence,
+                    priority=1,
+                    current_value=value,
+                    allocation_pct=alloc_pct,
+                    unrealized_pnl_pct=pnl_pct,
+                ))
+
+            elif pattern.bias == Bias.BEARISH and pattern.target_price and pattern.target_price < price:
+                downside_pct = (price - pattern.target_price) / price * 100
+                if downside_pct < 3:
+                    continue
+
+                report.opportunities.append(Opportunity(
+                    opp_type=OpportunityType.BREAKOUT_TRADE,
+                    symbol=symbol,
+                    headline=f"Bearish breakdown on {symbol}: {pattern.pattern.value} confirmed",
+                    details=(
+                        f"A confirmed {pattern.pattern.value} breakdown on {symbol}. "
+                        f"Measured target: ${pattern.target_price:,.2f} ({downside_pct:.1f}% downside). "
+                        f"Confidence: {pattern.confidence:.0%}. {pattern.description}"
+                    ),
+                    action_steps=[
+                        f"Sell 25-50% of {symbol} position to reduce exposure",
+                        f"Consider opening a futures short for remaining exposure",
+                        f"Buy back target: ${pattern.target_price:,.2f}",
+                        f"If already small position, set stop loss at ${price * 1.05:,.2f}",
+                    ],
+                    potential_gain=f"Avoid {downside_pct:.1f}% loss or profit from short",
+                    risk="Pattern fails and price reverses upward",
+                    confidence=pattern.confidence,
+                    priority=1,
+                    current_value=value,
+                    allocation_pct=alloc_pct,
+                    unrealized_pnl_pct=pnl_pct,
+                ))
+
     def _extract_signals(self, tf_data: dict[str, pd.DataFrame]) -> dict:
         """Extract key signal readings from multi-timeframe data."""
         signals = {
             "rsi": None,
             "macd_bearish": False,
+            "macd_hist": None,
             "trend_bullish": False,
             "trend_bearish": False,
             "bb_pct": None,
             "vol_ratio": None,
+            "atr": None,
+            "squeeze": False,
+            "dist_sma_50_pct": None,
+            "dist_sma_200_pct": None,
+            "sma_50": None,
+            "sma_200": None,
+            "bb_upper": None,
+            "bb_lower": None,
+            "close": None,
         }
 
         # Prefer 4h for swing signals, fallback to 1d, then 1h
@@ -570,6 +846,9 @@ class OpportunitiesEngine:
             df = tf_data[tf]
             last = df.iloc[-1]
 
+            if signals["close"] is None:
+                signals["close"] = float(last["close"])
+
             if signals["rsi"] is None and "rsi_14" in df.columns:
                 val = last.get("rsi_14")
                 if val and not pd.isna(val):
@@ -577,14 +856,20 @@ class OpportunitiesEngine:
 
             if "macd_hist" in df.columns:
                 val = last.get("macd_hist")
-                if val and not pd.isna(val) and val < 0:
-                    signals["macd_bearish"] = True
+                if val and not pd.isna(val):
+                    if val < 0:
+                        signals["macd_bearish"] = True
+                    if signals["macd_hist"] is None:
+                        signals["macd_hist"] = float(val)
 
             if "sma_50" in df.columns and "sma_200" in df.columns:
                 sma50 = last.get("sma_50")
                 sma200 = last.get("sma_200")
                 close = last["close"]
                 if sma50 and sma200 and not pd.isna(sma50) and not pd.isna(sma200):
+                    if signals["sma_50"] is None:
+                        signals["sma_50"] = float(sma50)
+                        signals["sma_200"] = float(sma200)
                     if close > sma50 > sma200:
                         signals["trend_bullish"] = True
                     elif close < sma50 < sma200:
@@ -599,5 +884,32 @@ class OpportunitiesEngine:
                 val = last.get("vol_ratio")
                 if val and not pd.isna(val):
                     signals["vol_ratio"] = float(val)
+
+            if signals["atr"] is None and "atr_14" in df.columns:
+                val = last.get("atr_14")
+                if val and not pd.isna(val):
+                    signals["atr"] = float(val)
+
+            if "squeeze_on" in df.columns and last.get("squeeze_on"):
+                signals["squeeze"] = True
+
+            if signals["dist_sma_50_pct"] is None and "dist_sma_50_pct" in df.columns:
+                val = last.get("dist_sma_50_pct")
+                if val is not None and not pd.isna(val):
+                    signals["dist_sma_50_pct"] = float(val)
+
+            if signals["dist_sma_200_pct"] is None and "dist_sma_200_pct" in df.columns:
+                val = last.get("dist_sma_200_pct")
+                if val is not None and not pd.isna(val):
+                    signals["dist_sma_200_pct"] = float(val)
+
+            if signals["bb_upper"] is None and "bb_upper" in df.columns:
+                val = last.get("bb_upper")
+                if val and not pd.isna(val):
+                    signals["bb_upper"] = float(val)
+            if signals["bb_lower"] is None and "bb_lower" in df.columns:
+                val = last.get("bb_lower")
+                if val and not pd.isna(val):
+                    signals["bb_lower"] = float(val)
 
         return signals
