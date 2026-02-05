@@ -22,10 +22,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Robinhood
+    # Robinhood (Option A: live API via robin_stocks)
     robinhood_username: str = ""
     robinhood_password: str = ""
     robinhood_totp_secret: str = ""  # base32 secret for 2FA (from authenticator app setup)
+
+    # Robinhood (Option B: CSV import fallback - used if API creds not set)
+    robinhood_holdings_csv: str = ""  # path to exported holdings CSV
 
     # Exchange keys
     binance_api_key: str = ""

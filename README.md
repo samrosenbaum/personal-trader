@@ -45,6 +45,12 @@ trader watch
 
 ## Setting Up Robinhood
 
+Two options -- live API gives the most data, CSV is simpler if you don't want to store credentials.
+
+### Option A: Live API (recommended)
+
+Gets crypto, stocks, ETFs, options, cash balance, cost basis, and unrealized P&L.
+
 1. Add your Robinhood credentials to `.env`:
    ```
    ROBINHOOD_USERNAME=your_email@example.com
@@ -62,6 +68,29 @@ trader watch
    - Then scan the QR code with your authenticator app as well (so you have a backup)
 
 3. Without the TOTP secret, Robinhood may send SMS codes which require manual entry.
+
+### Option B: CSV Import (fallback)
+
+If you don't want to store credentials, export your holdings as a CSV and point to it:
+
+```
+ROBINHOOD_HOLDINGS_CSV=/path/to/robinhood_holdings.csv
+```
+
+The CSV just needs a symbol column and a quantity column. Flexible naming accepted:
+- Symbol: `symbol`, `asset`, `currency`, or `coin`
+- Quantity: `quantity`, `qty`, `amount`, or `balance`
+
+Example:
+```csv
+symbol,quantity
+BTC,0.5
+ETH,3.2
+SOL,50
+```
+
+Prices are fetched live from exchanges so values stay current.
+The CSV is only used when API credentials are not configured.
 
 ## Commands
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import ccxt
@@ -78,6 +80,64 @@ class ExchangeManager:
         if not self.exchanges:
             logger.warning("No exchanges connected. Using public data only.")
 
+    def _load_robinhood_csv(self) -> dict[str, float] | None:
+        """Load Robinhood holdings from a CSV export.
+
+        Used as a fallback when API credentials are not configured.
+        Accepts flexible column names: symbol/asset/currency/coin for the
+        asset, and quantity/qty/amount/balance for the amount.
+        """
+        csv_path = self.settings.robinhood_holdings_csv.strip()
+        if not csv_path:
+            return None
+
+        path = Path(csv_path).expanduser()
+        if not path.exists():
+            logger.warning(f"Robinhood CSV not found: {path}")
+            return None
+
+        balances: dict[str, float] = {}
+        try:
+            with path.open(newline="", encoding="utf-8-sig") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    symbol = (
+                        row.get("asset")
+                        or row.get("symbol")
+                        or row.get("currency")
+                        or row.get("coin")
+                        or ""
+                    ).strip().upper()
+                    if not symbol:
+                        continue
+
+                    qty_raw = (
+                        row.get("quantity")
+                        or row.get("qty")
+                        or row.get("amount")
+                        or row.get("balance")
+                        or "0"
+                    )
+                    try:
+                        quantity = float(str(qty_raw).replace(",", "").strip())
+                    except ValueError:
+                        continue
+                    if quantity <= 0:
+                        continue
+
+                    usd_value = self._get_usd_value(
+                        self.get_public_exchange(), symbol, quantity
+                    )
+                    if usd_value > 0:
+                        balances[symbol] = balances.get(symbol, 0.0) + usd_value
+
+            logger.info(f"Loaded {len(balances)} assets from Robinhood CSV")
+        except Exception as e:
+            logger.warning(f"Failed to parse Robinhood CSV: {e}")
+            return None
+
+        return balances if balances else None
+
     def _get_robinhood(self):
         """Lazy-load the Robinhood connector."""
         if self._robinhood is None and self.settings.robinhood_username:
@@ -121,9 +181,9 @@ class ExchangeManager:
             except Exception as e:
                 logger.error(f"Error fetching balance from {name}: {e}")
 
-        # --- Robinhood ---
+        # --- Robinhood (live API first, CSV fallback) ---
         rh_portfolio = self.get_robinhood_portfolio()
-        if rh_portfolio:
+        if rh_portfolio and rh_portfolio.total_equity > 0:
             rh_balances: dict[str, float] = {}
             for h in rh_portfolio.crypto_holdings:
                 portfolio.balances[h.symbol] = portfolio.balances.get(h.symbol, 0) + h.market_value
@@ -135,6 +195,13 @@ class ExchangeManager:
                 portfolio.balances["USD"] = portfolio.balances.get("USD", 0) + rh_portfolio.cash_balance
                 rh_balances["USD"] = rh_portfolio.cash_balance
             portfolio.exchange_breakdown["robinhood"] = rh_balances
+        else:
+            # Fallback: try CSV import
+            csv_balances = self._load_robinhood_csv()
+            if csv_balances:
+                portfolio.exchange_breakdown["robinhood_csv"] = csv_balances
+                for asset, usd_value in csv_balances.items():
+                    portfolio.balances[asset] = portfolio.balances.get(asset, 0.0) + usd_value
 
         portfolio.total_usd = sum(portfolio.balances.values())
         return portfolio
