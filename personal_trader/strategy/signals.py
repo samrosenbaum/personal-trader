@@ -29,9 +29,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from personal_trader.analysis.derivatives_market import FuturesBasis, VolSurface
+from personal_trader.analysis.macro import MacroSnapshot
+from personal_trader.analysis.microstructure import OrderBookMetrics, VolumeProfile
 from personal_trader.analysis.patterns import Bias, DetectedPattern, PatternReport, PatternType
 from personal_trader.analysis.sentiment import SentimentLevel, SentimentReport
 from personal_trader.config import RiskProfile
+from personal_trader.strategy.orders import OrderPlan, OrderPlanner
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,7 @@ class Signal:
     stop_loss: float | None = None
     take_profit: float | None = None
     timeframe: str = ""
+    order_plan: OrderPlan | None = None
 
     @property
     def summary(self) -> str:
@@ -100,6 +105,7 @@ class SignalGenerator:
 
     def __init__(self, risk_profile: RiskProfile = RiskProfile.MODERATE) -> None:
         self.risk_profile = risk_profile
+        self.order_planner = OrderPlanner(risk_profile)
 
     def generate(
         self,
@@ -107,6 +113,14 @@ class SignalGenerator:
         indicators: dict[str, pd.DataFrame],
         patterns: PatternReport | None = None,
         sentiment: SentimentReport | None = None,
+        microstructure: OrderBookMetrics | None = None,
+        volume_profile: VolumeProfile | None = None,
+        anchored_vwap: float | None = None,
+        macro: MacroSnapshot | None = None,
+        vol_surface: VolSurface | None = None,
+        futures_basis: FuturesBasis | None = None,
+        cross_asset_corr: float | None = None,
+        portfolio_value: float | None = None,
     ) -> list[Signal]:
         """Generate signals for a symbol.
 
@@ -139,6 +153,26 @@ class SignalGenerator:
             + structure["score"] * weights["structure"]
         )
 
+        # Microstructure adjustment
+        if microstructure:
+            if microstructure.spread_pct > 0.2:
+                composite *= 0.9
+            if microstructure.bid_ask_imbalance > 0.15:
+                composite += 5
+            if microstructure.bid_ask_imbalance < -0.15:
+                composite -= 5
+
+        # Macro regime adjustment
+        if macro:
+            composite += 5 if macro.risk_on else -5
+
+        # Derivatives bias adjustment
+        if futures_basis:
+            if futures_basis.basis_pct > 0.3:
+                composite += 3
+            elif futures_basis.basis_pct < -0.3:
+                composite -= 3
+
         # Apply modifiers from advanced analysis
         # Confluence: if multiple timeframes agree, amplify the signal
         composite *= confluence["amplifier"]
@@ -157,11 +191,20 @@ class SignalGenerator:
 
         reasons = self._build_reasons(
             ta_scores, pattern_score, sentiment_score, patterns, sentiment,
-            confluence=confluence, structure=structure, vol_regime=vol_regime,
+            confluence=confluence,
+            structure=structure,
+            vol_regime=vol_regime,
+            microstructure=microstructure,
+            volume_profile=volume_profile,
+            anchored_vwap=anchored_vwap,
+            macro=macro,
+            vol_surface=vol_surface,
+            futures_basis=futures_basis,
+            cross_asset_corr=cross_asset_corr,
         )
 
         # Calculate entry/stop/target from S/R levels + technicals
-        entry, stop, target = self._compute_levels(indicators, action, patterns)
+        entry, stop, target, atr = self._compute_levels(indicators, action, patterns)
 
         primary = Signal(
             symbol=symbol,
@@ -174,6 +217,7 @@ class SignalGenerator:
             take_profit=target,
             timeframe="multi",
         )
+        primary.order_plan = self.order_planner.build_plan(primary, portfolio_value, atr=atr)
         signals.append(primary)
 
         # Add derivative strategy signals if applicable
@@ -473,7 +517,7 @@ class SignalGenerator:
         indicators: dict[str, pd.DataFrame],
         action: Action,
         patterns: PatternReport | None = None,
-    ) -> tuple[float | None, float | None, float | None]:
+    ) -> tuple[float | None, float | None, float | None, float | None]:
         """Compute entry, stop-loss, and take-profit using S/R levels + ATR.
 
         Priority for stop/target placement:
@@ -494,7 +538,7 @@ class SignalGenerator:
                 Action.BUY, Action.STRONG_BUY,
                 Action.SELL, Action.STRONG_SELL, Action.MOVE_TO_STABLE,
             ):
-                return close, None, None
+                return close, None, None, None
 
             is_long = action in (Action.BUY, Action.STRONG_BUY)
 
@@ -583,9 +627,9 @@ class SignalGenerator:
                 else:
                     target = close - risk * 2
 
-            return round(entry, 2), round(stop, 2), round(target, 2)
+            return round(entry, 2), round(stop, 2), round(target, 2), round(atr, 4)
 
-        return None, None, None
+        return None, None, None, None
 
     # ------------------------------------------------------------------
     # Advanced analysis methods
@@ -834,6 +878,13 @@ class SignalGenerator:
         confluence: dict | None = None,
         structure: dict | None = None,
         vol_regime: dict | None = None,
+        microstructure: OrderBookMetrics | None = None,
+        volume_profile: VolumeProfile | None = None,
+        anchored_vwap: float | None = None,
+        macro: MacroSnapshot | None = None,
+        vol_surface: VolSurface | None = None,
+        futures_basis: FuturesBasis | None = None,
+        cross_asset_corr: float | None = None,
     ) -> list[str]:
         """Build human-readable reasons for the signal."""
         reasons = []
@@ -885,5 +936,41 @@ class SignalGenerator:
         if sentiment and sentiment.fear_greed:
             fg = sentiment.fear_greed
             reasons.append(f"Market sentiment: {fg.label} ({fg.value}/100)")
+
+        if microstructure:
+            reasons.append(
+                f"Order book: spread {microstructure.spread_pct:.2f}% "
+                f"| imbalance {microstructure.bid_ask_imbalance:+.2f}"
+            )
+
+        if volume_profile:
+            reasons.append(
+                f"Volume profile POC {volume_profile.poc:.2f} "
+                f"(VA {volume_profile.value_area_low:.2f}-{volume_profile.value_area_high:.2f})"
+            )
+
+        if anchored_vwap:
+            reasons.append(f"Anchored VWAP: {anchored_vwap:.2f}")
+
+        if macro:
+            regime = "risk-on" if macro.risk_on else "risk-off"
+            reasons.append(
+                f"Macro regime: {regime} | DXY {macro.dxy_trend}, SPX {macro.spx_trend}"
+            )
+            if macro.notes:
+                reasons.append(f"Macro notes: {', '.join(macro.notes[:2])}")
+
+        if vol_surface and vol_surface.points:
+            point = vol_surface.points[0]
+            if point.atm_iv:
+                reasons.append(f"Options IV {point.tenor_days}d: {point.atm_iv:.1f}%")
+            if point.skew is not None:
+                reasons.append(f"IV skew {point.tenor_days}d: {point.skew:+.1f}")
+
+        if futures_basis:
+            reasons.append(f"Futures basis: {futures_basis.basis_pct:+.2f}%")
+
+        if cross_asset_corr is not None:
+            reasons.append(f"SPX correlation: {cross_asset_corr:+.2f}")
 
         return reasons

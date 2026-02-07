@@ -7,6 +7,7 @@ Commands:
     trader opportunities   - What can I do with what I hold to make money?
     trader analyze BTC     - Deep analysis of a specific asset
     trader signals         - Show latest trading signals
+    trader backtest        - Run a simple signal backtest
     trader derivatives     - Show derivatives strategy recommendations
     trader config          - Show current configuration
 """
@@ -306,7 +307,17 @@ def portfolio() -> None:
 
     # --- Risk analysis ---
     risk_mgr = RiskManager(settings.risk_profile)
-    report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd)
+    price_histories = {}
+    for asset in list(pf.balances.keys())[:8]:
+        if asset.upper() in ("USD", "USDT", "USDC", "BUSD", "DAI"):
+            continue
+        symbol = f"{asset}/USDT"
+        try:
+            price_histories[asset] = em.fetch_ohlcv(symbol, "1d", 200)
+        except Exception:
+            continue
+
+    report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd, price_histories=price_histories)
 
     risk_table = Table(title="Risk Analysis")
     risk_table.add_column("Metric", style="bold")
@@ -322,6 +333,10 @@ def portfolio() -> None:
     risk_table.add_row("Top Concentration", f"{report.top_concentration_pct:.1f}%")
     if report.portfolio_volatility:
         risk_table.add_row("Portfolio Volatility", f"{report.portfolio_volatility:.1f}%")
+    if report.var_95:
+        risk_table.add_row("VaR 95% (1d)", f"${report.var_95:,.0f}")
+    if report.cvar_95:
+        risk_table.add_row("CVaR 95% (1d)", f"${report.cvar_95:,.0f}")
     console.print(risk_table)
 
     if report.warnings:
@@ -333,6 +348,11 @@ def portfolio() -> None:
         console.print("\n[bold cyan]Suggestions:[/bold cyan]")
         for s in report.suggestions:
             console.print(f"  > {s}")
+
+    if report.stress_tests:
+        console.print("\n[bold]Stress Tests:[/bold]")
+        for scenario in report.stress_tests:
+            console.print(f"  - {scenario}")
 
 
 # ---------------------------------------------------------------------------
@@ -646,11 +666,17 @@ def analyze(asset: str, quote: str) -> None:
 
     # Generate signals
     sentiment = scanner.sentiment_analyzer.get_full_report()
+    portfolio_value = None
+    try:
+        portfolio_value = em.get_portfolio().total_usd
+    except Exception:
+        portfolio_value = None
     signals = scanner.signal_gen.generate(
         symbol=symbol,
         indicators=tf_data,
         patterns=report if "1d" in tf_data else None,
         sentiment=sentiment,
+        portfolio_value=portfolio_value,
     )
 
     if signals:
@@ -662,8 +688,15 @@ def analyze(asset: str, quote: str) -> None:
         sig_table.add_column("Entry", justify="right")
         sig_table.add_column("Stop Loss", justify="right")
         sig_table.add_column("Take Profit", justify="right")
+        sig_table.add_column("Size", justify="right")
 
         for sig in signals:
+            size_text = "-"
+            if sig.order_plan and sig.order_plan.position_sizing:
+                size_pct = sig.order_plan.position_sizing.get("position_pct")
+                units = sig.order_plan.position_sizing.get("units")
+                if size_pct is not None and units is not None:
+                    size_text = f"{size_pct:.1f}% ({units:.4f})"
             sig_table.add_row(
                 Text(sig.action.value.upper(), style=_color_for_action(sig.action.value)),
                 Text(sig.urgency.value.upper(), style=_urgency_color(sig.urgency.value)),
@@ -671,14 +704,50 @@ def analyze(asset: str, quote: str) -> None:
                 f"${sig.entry_price:,.2f}" if sig.entry_price else "-",
                 f"${sig.stop_loss:,.2f}" if sig.stop_loss else "-",
                 f"${sig.take_profit:,.2f}" if sig.take_profit else "-",
+                size_text,
             )
         console.print(sig_table)
+
+        for sig in signals:
+            if sig.order_plan and sig.order_plan.ladder:
+                console.print("\n[bold]Scaling Ladder:[/bold]")
+                ladder_table = Table(show_lines=True)
+                ladder_table.add_column("Price", justify="right")
+                ladder_table.add_column("Allocation %", justify="right")
+                ladder_table.add_column("Note")
+                for step in sig.order_plan.ladder:
+                    ladder_table.add_row(
+                        f"${step.price:,.2f}",
+                        f"{step.allocation_pct:.0f}%",
+                        step.note,
+                    )
+                console.print(ladder_table)
+                break
 
         console.print("\n[bold]Reasons:[/bold]")
         for sig in signals:
             console.print(f"\n  [{_color_for_action(sig.action.value)}]{sig.action.value.upper()}[/]:")
             for r in sig.reasons:
                 console.print(f"    - {r}")
+
+        # Backtest snapshot (1d)
+        try:
+            from personal_trader.analysis.backtest import run_backtest
+
+            if "1d" in tf_data:
+                bt = run_backtest(
+                    symbol=symbol,
+                    df=tf_data["1d"],
+                    risk_profile=settings.risk_profile,
+                )
+                if bt:
+                    console.print(
+                        f"\n[bold]Backtest (1d):[/bold] "
+                        f"Win rate {bt.win_rate:.0%}, Avg R {bt.avg_r_multiple:.2f}, "
+                        f"Trades {bt.trades}"
+                    )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -712,8 +781,15 @@ def signals() -> None:
     table.add_column("Entry", justify="right")
     table.add_column("Stop", justify="right")
     table.add_column("Target", justify="right")
+    table.add_column("Size", justify="right")
 
     for result, sig in all_signals[:20]:
+        size_text = "-"
+        if sig.order_plan and sig.order_plan.position_sizing:
+            size_pct = sig.order_plan.position_sizing.get("position_pct")
+            units = sig.order_plan.position_sizing.get("units")
+            if size_pct is not None and units is not None:
+                size_text = f"{size_pct:.1f}% ({units:.4f})"
         table.add_row(
             sig.symbol,
             f"${result.price:,.2f}" if result.price else "-",
@@ -723,10 +799,53 @@ def signals() -> None:
             f"${sig.entry_price:,.2f}" if sig.entry_price else "-",
             f"${sig.stop_loss:,.2f}" if sig.stop_loss else "-",
             f"${sig.take_profit:,.2f}" if sig.take_profit else "-",
+            size_text,
         )
 
     console.print(table)
 
+
+# ---------------------------------------------------------------------------
+# backtest
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.argument("symbol")
+@click.option("--timeframe", "-t", default="1d", help="Timeframe for backtest data")
+@click.option("--limit", "-l", default=500, type=int, help="Candles to use")
+def backtest(symbol: str, timeframe: str, limit: int) -> None:
+    """Run a simple historical backtest for a symbol."""
+    from personal_trader.analysis.backtest import run_backtest
+
+    settings, em, _scanner = _get_components()
+    console.print(Panel(f"Backtesting {symbol} on {timeframe}...", style="bold cyan"))
+
+    try:
+        df = em.fetch_ohlcv(symbol, timeframe, limit=limit)
+    except Exception as e:
+        console.print(f"[red]Failed to fetch data: {e}[/red]")
+        return
+
+    result = run_backtest(symbol, df, settings.risk_profile)
+    if not result:
+        console.print("[yellow]Insufficient data or no trades generated.[/yellow]")
+        return
+
+    table = Table(title="Backtest Summary")
+    table.add_column("Symbol", style="bold")
+    table.add_column("Win Rate", justify="right")
+    table.add_column("Avg R", justify="right")
+    table.add_column("Trades", justify="right")
+    table.add_column("Samples", justify="right")
+    table.add_row(
+        result.symbol,
+        f"{result.win_rate:.0%}",
+        f"{result.avg_r_multiple:.2f}",
+        str(result.trades),
+        str(result.sample_size),
+    )
+    console.print(table)
 
 # ---------------------------------------------------------------------------
 # derivatives

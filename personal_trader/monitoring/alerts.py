@@ -56,6 +56,18 @@ class AlertDispatcher:
             lines.append(f"Stop Loss: ${signal.stop_loss:,.2f}")
         if signal.take_profit:
             lines.append(f"Take Profit: ${signal.take_profit:,.2f}")
+        if signal.order_plan and signal.order_plan.position_sizing:
+            sizing = signal.order_plan.position_sizing
+            pct = sizing.get("position_pct")
+            units = sizing.get("units")
+            if pct is not None and units is not None:
+                lines.append(f"Size: {pct:.1f}% ({units:.6f} units)")
+        if signal.order_plan and signal.order_plan.ladder:
+            ladder = ", ".join(
+                f"{step.allocation_pct:.0f}% @ {step.price:.2f}"
+                for step in signal.order_plan.ladder
+            )
+            lines.append(f"Ladder: {ladder}")
         lines.append(f"Reasons:")
         for r in signal.reasons:
             lines.append(f"  - {r}")
