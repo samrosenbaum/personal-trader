@@ -44,9 +44,12 @@ class PortfolioRiskReport:
     stablecoin_pct: float
     top_concentration_pct: float  # largest single position %
     portfolio_volatility: float | None
+    var_95: float | None = None
+    cvar_95: float | None = None
     positions: list[PositionRisk] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    stress_tests: list[str] = field(default_factory=list)
 
 
 STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "LUSD", "USD"}
@@ -146,6 +149,7 @@ class RiskManager:
         top_concentration = max(allocations.values()) if allocations else 0
         diversification = self._diversification_score(allocations)
         portfolio_vol = self._portfolio_volatility(balances, total_usd, price_histories)
+        var_95, cvar_95 = self._portfolio_var_cvar(balances, total_usd, price_histories)
 
         overall_risk = self._overall_risk(stablecoin_pct, top_concentration, portfolio_vol)
 
@@ -156,6 +160,8 @@ class RiskManager:
             stablecoin_pct=round(stablecoin_pct, 2),
             top_concentration_pct=round(top_concentration, 2),
             portfolio_volatility=round(portfolio_vol, 2) if portfolio_vol else None,
+            var_95=round(var_95, 2) if var_95 is not None else None,
+            cvar_95=round(cvar_95, 2) if cvar_95 is not None else None,
             positions=sorted(positions, key=lambda p: p.allocation_pct, reverse=True),
         )
 
@@ -176,6 +182,7 @@ class RiskManager:
 
         # Generate suggestions
         report.suggestions = self._generate_suggestions(report)
+        report.stress_tests = self._stress_test_scenarios(balances, total_usd, price_histories)
 
         return report
 
@@ -209,6 +216,17 @@ class RiskManager:
             "entry": entry_price,
         }
 
+    def adjusted_max_leverage(self, portfolio_volatility: float | None) -> float:
+        """Dynamically adjust max leverage based on volatility regime."""
+        base = self.params["max_leverage"]
+        if portfolio_volatility is None:
+            return base
+        if portfolio_volatility > 80:
+            return max(1.0, base * 0.5)
+        if portfolio_volatility > 50:
+            return base * 0.75
+        return base
+
     @staticmethod
     def _max_drawdown(prices: np.ndarray) -> float:
         """Calculate maximum drawdown percentage."""
@@ -221,6 +239,65 @@ class RiskManager:
             if dd > max_dd:
                 max_dd = dd
         return max_dd
+
+    def _portfolio_var_cvar(
+        self,
+        balances: dict[str, float],
+        total_usd: float,
+        price_histories: dict[str, pd.DataFrame],
+    ) -> tuple[float | None, float | None]:
+        """Compute 95% VaR/CVaR using historical returns."""
+        if total_usd == 0:
+            return None, None
+        returns = self._portfolio_returns(balances, total_usd, price_histories)
+        if returns is None or returns.empty:
+            return None, None
+        var_level = np.percentile(returns, 5)
+        cvar = returns[returns <= var_level].mean()
+        return float(abs(var_level) * total_usd), float(abs(cvar) * total_usd)
+
+    def _portfolio_returns(
+        self,
+        balances: dict[str, float],
+        total_usd: float,
+        price_histories: dict[str, pd.DataFrame],
+    ) -> pd.Series | None:
+        if not price_histories:
+            return None
+        weighted = []
+        for asset, usd_val in balances.items():
+            if asset not in price_histories or usd_val <= 0:
+                continue
+            hist = price_histories[asset]
+            if len(hist) < 30 or "close" not in hist:
+                continue
+            returns = hist["close"].pct_change().dropna()
+            weight = usd_val / total_usd
+            weighted.append(returns * weight)
+        if not weighted:
+            return None
+        return sum(weighted)
+
+    def _stress_test_scenarios(
+        self,
+        balances: dict[str, float],
+        total_usd: float,
+        price_histories: dict[str, pd.DataFrame],
+    ) -> list[str]:
+        """Simple stress scenarios based on dominant assets."""
+        scenarios = []
+        if total_usd == 0:
+            return scenarios
+        top_assets = sorted(balances.items(), key=lambda x: x[1], reverse=True)[:3]
+        for asset, usd_val in top_assets:
+            loss = usd_val * 0.2
+            scenarios.append(f"{asset} -20% shock: -${loss:,.0f}")
+        if price_histories:
+            returns = self._portfolio_returns(balances, total_usd, price_histories)
+            if returns is not None and not returns.empty:
+                worst = returns.min() * total_usd
+                scenarios.append(f"Worst 1-day historical loss: -${abs(worst):,.0f}")
+        return scenarios
 
     @staticmethod
     def _diversification_score(allocations: dict[str, float]) -> float:
@@ -357,6 +434,13 @@ class RiskManager:
             suggestions.append(
                 f"Consider hedging {pos.symbol} (vol: {pos.volatility_30d}%) with futures or reducing size"
             )
+
+        if report.portfolio_volatility is not None:
+            adjusted = self.adjusted_max_leverage(report.portfolio_volatility)
+            if adjusted < self.params["max_leverage"]:
+                suggestions.append(
+                    f"High volatility detected; reduce max leverage to ~{adjusted:.1f}x"
+                )
 
         if not suggestions:
             suggestions.append("Portfolio is within risk parameters - no immediate action needed")

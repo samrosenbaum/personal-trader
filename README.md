@@ -10,6 +10,10 @@ Crypto and stock portfolio analyzer that connects to your **Robinhood** and **Co
 - **Technical analysis** - 40+ indicators (RSI, MACD, Bollinger, Ichimoku, ADX, etc.) across multiple timeframes
 - **Chart pattern recognition** - Double top/bottom, head & shoulders, triangles, flags, candlestick patterns
 - **Market sentiment** - Fear & Greed Index, funding rates, market cap trends
+- **Order planning** - Bracket-style entry/stop/target plans with portfolio-aware position sizing
+- **Microstructure analytics** - Order book imbalance, spreads, volume profile, anchored VWAP
+- **Macro regime filters** - DXY/SPX/VIX context for risk-on/off signals
+- **Derivatives intelligence** - Options IV term structure + futures basis for trend bias
 - **Derivatives advisor** - When to hedge with futures, buy puts for crash protection, sell puts for income
 - **Portfolio risk management** - Concentration analysis, volatility tracking, diversification scoring
 - **Continuous monitoring** - Background scanner with Telegram and Discord alerts
@@ -101,6 +105,7 @@ The CSV is only used when API credentials are not configured.
 | `trader scan` | Scan watchlist symbols, show trading signals |
 | `trader analyze BTC` | Deep technical analysis for a specific asset |
 | `trader signals` | Top trading signals across all watched assets |
+| `trader backtest BTC/USDT` | Backtest signal logic on historical data |
 | `trader derivatives BTC` | Futures and options strategy recommendations |
 | `trader sentiment` | Fear & Greed index, market overview, funding rates |
 | `trader watch` | Continuous monitoring loop with alerts |
