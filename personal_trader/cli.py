@@ -7,6 +7,7 @@ Commands:
     trader opportunities   - What can I do with what I hold to make money?
     trader analyze BTC     - Deep analysis of a specific asset
     trader signals         - Show latest trading signals
+    trader history         - View trade history and realized P&L
     trader derivatives     - Show derivatives strategy recommendations
     trader config          - Show current configuration
 """
@@ -306,7 +307,12 @@ def portfolio() -> None:
 
     # --- Risk analysis ---
     risk_mgr = RiskManager(settings.risk_profile)
-    report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd)
+    cost_basis = {}
+    try:
+        cost_basis = em.get_cost_basis()
+    except Exception:
+        pass
+    report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd, cost_basis=cost_basis)
 
     risk_table = Table(title="Risk Analysis")
     risk_table.add_column("Metric", style="bold")
@@ -322,7 +328,16 @@ def portfolio() -> None:
     risk_table.add_row("Top Concentration", f"{report.top_concentration_pct:.1f}%")
     if report.portfolio_volatility:
         risk_table.add_row("Portfolio Volatility", f"{report.portfolio_volatility:.1f}%")
+    if report.var_95:
+        risk_table.add_row("VaR 95% (1d)", f"${report.var_95:,.0f}")
+    if report.cvar_95:
+        risk_table.add_row("CVaR 95% (1d)", f"${report.cvar_95:,.0f}")
     console.print(risk_table)
+
+    if report.stress_tests:
+        console.print("\n[bold]Stress Tests:[/bold]")
+        for scenario in report.stress_tests:
+            console.print(f"  - {scenario}")
 
     if report.warnings:
         console.print("\n[bold red]Warnings:[/bold red]")
@@ -413,6 +428,13 @@ def opportunities() -> None:
             })
         cash_total += rh_portfolio.cash_balance
 
+    # Fetch cost basis from trade history for exchange positions
+    cost_basis = {}
+    try:
+        cost_basis = em.get_cost_basis()
+    except Exception as e:
+        console.print(f"  [dim]Could not fetch trade history for cost basis: {e}[/dim]")
+
     # Exchange holdings
     for source, balances in pf.exchange_breakdown.items():
         if source == "robinhood":
@@ -426,13 +448,26 @@ def opportunities() -> None:
                 if existing:
                     existing["value"] += value
                 else:
+                    # Use cost basis from trade history if available
+                    avg_cost = cost_basis.get(asset, 0)
+                    # Estimate quantity and current price from value
+                    current_price = 0.0
+                    quantity = 0.0
+                    try:
+                        ticker = em.fetch_ticker(f"{asset}/USDT")
+                        current_price = ticker["last"]
+                        quantity = value / current_price if current_price > 0 else 0
+                    except Exception:
+                        pass
+                    pnl_pct = ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 and current_price > 0 else 0
+
                     holdings.append({
                         "symbol": asset,
                         "value": value,
-                        "quantity": 0,
-                        "avg_cost": 0,
-                        "current_price": 0,
-                        "unrealized_pnl_pct": 0,
+                        "quantity": quantity,
+                        "avg_cost": avg_cost,
+                        "current_price": current_price,
+                        "unrealized_pnl_pct": pnl_pct,
                         "asset_type": "crypto",
                         "source": source,
                     })
@@ -726,6 +761,123 @@ def signals() -> None:
         )
 
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# history
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--symbol", "-s", default=None, help="Filter by symbol (e.g. BTC)")
+@click.option("--days", "-d", default=90, type=int, help="Days of history to fetch")
+@click.option("--source", default=None, help="Filter by source (robinhood, coinbase, etc.)")
+@click.option("--limit", "-l", default=30, type=int, help="Number of recent trades to show")
+def history(symbol: str | None, days: int, source: str | None, limit: int) -> None:
+    """View trade history and realized P&L across all accounts."""
+    from datetime import datetime, timedelta, timezone
+
+    settings, em, _scanner = _get_components()
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    console.print(Panel(f"Fetching trade history (last {days} days)...", style="bold cyan"))
+
+    trade_history = em.get_trade_history(since=since)
+
+    if not trade_history.trades:
+        console.print("[yellow]No trades found. Check your API credentials and connections.[/yellow]")
+        return
+
+    trades = trade_history.trades
+
+    # Apply filters
+    if symbol:
+        symbol_upper = symbol.upper()
+        trades = [t for t in trades if t.symbol == symbol_upper]
+    if source:
+        source_lower = source.lower()
+        trades = [t for t in trades if t.source == source_lower]
+
+    # --- Realized P&L Summary ---
+    pnl_data = trade_history.realized_pnl
+    if symbol:
+        pnl_data = {k: v for k, v in pnl_data.items() if k == symbol.upper()}
+
+    if pnl_data:
+        pnl_table = Table(title="Realized P&L Summary", show_lines=True)
+        pnl_table.add_column("Symbol", style="bold")
+        pnl_table.add_column("Realized P&L", justify="right")
+        pnl_table.add_column("P&L %", justify="right")
+        pnl_table.add_column("Cost Basis", justify="right")
+        pnl_table.add_column("Proceeds", justify="right")
+        pnl_table.add_column("Avg Buy", justify="right")
+        pnl_table.add_column("Avg Sell", justify="right")
+        pnl_table.add_column("Trades", justify="right")
+
+        for sym, pnl in sorted(pnl_data.items(), key=lambda x: abs(x[1].total_realized_pnl), reverse=True):
+            pnl_color = "green" if pnl.total_realized_pnl >= 0 else "red"
+            pnl_table.add_row(
+                sym,
+                Text(f"${pnl.total_realized_pnl:+,.2f}", style=pnl_color),
+                Text(f"{pnl.pnl_pct:+.1f}%", style=pnl_color),
+                f"${pnl.total_cost_basis:,.2f}",
+                f"${pnl.total_proceeds:,.2f}",
+                f"${pnl.avg_buy_price:,.2f}",
+                f"${pnl.avg_sell_price:,.2f}",
+                str(pnl.trade_count),
+            )
+
+        console.print(pnl_table)
+        console.print()
+
+    # --- Recent Trades ---
+    recent = sorted(trades, key=lambda t: t.timestamp, reverse=True)[:limit]
+
+    if recent:
+        trade_table = Table(title=f"Recent Trades (showing {len(recent)})", show_lines=True)
+        trade_table.add_column("Date", style="dim")
+        trade_table.add_column("Symbol", style="bold")
+        trade_table.add_column("Side", justify="center")
+        trade_table.add_column("Quantity", justify="right")
+        trade_table.add_column("Price", justify="right")
+        trade_table.add_column("Total", justify="right")
+        trade_table.add_column("Fee", justify="right")
+        trade_table.add_column("Source")
+
+        for t in recent:
+            side_color = "green" if t.side.value == "buy" else "red"
+            trade_table.add_row(
+                t.timestamp.strftime("%Y-%m-%d %H:%M"),
+                t.symbol,
+                Text(t.side.value.upper(), style=side_color),
+                f"{t.quantity:.6f}",
+                f"${t.price:,.2f}",
+                f"${t.total:,.2f}",
+                f"${t.fee:.2f}" if t.fee > 0 else "-",
+                t.source.title(),
+            )
+
+        console.print(trade_table)
+
+    # --- Summary ---
+    total_pnl_color = "green" if trade_history.total_realized_pnl >= 0 else "red"
+    summary_lines = [
+        f"Total trades: {len(trades)}",
+        f"Total realized P&L: [{total_pnl_color}]${trade_history.total_realized_pnl:+,.2f}[/{total_pnl_color}]",
+        f"Total fees paid: ${trade_history.total_fees:,.2f}",
+    ]
+
+    # Show current cost basis
+    cost_basis = em.get_cost_basis()
+    if cost_basis:
+        cb_filtered = cost_basis if not symbol else {k: v for k, v in cost_basis.items() if k == symbol.upper()}
+        if cb_filtered:
+            summary_lines.append("")
+            summary_lines.append("[bold]Current Cost Basis (avg per unit):[/bold]")
+            for sym, avg_cost in sorted(cb_filtered.items()):
+                summary_lines.append(f"  {sym}: ${avg_cost:,.2f}")
+
+    console.print(Panel("\n".join(summary_lines), title="Summary", border_style="cyan"))
 
 
 # ---------------------------------------------------------------------------

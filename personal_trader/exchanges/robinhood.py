@@ -5,6 +5,7 @@ Uses robin_stocks to:
 - Fetch crypto holdings with current market values
 - Fetch stock/ETF holdings with current market values
 - Fetch options positions
+- Fetch crypto and stock order history for P&L tracking
 - Provide a unified view alongside exchange portfolios
 
 This is READ-ONLY - no trades are placed through this connector.
@@ -14,8 +15,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from personal_trader.config import Settings
+from personal_trader.exchanges.trades import Trade, TradeSide, TradeStatus
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +319,157 @@ class RobinhoodConnector:
             return float(profile.get("crypto_buying_power", 0) or 0)
         except Exception:
             return 0.0
+
+    def get_crypto_order_history(self) -> list[Trade]:
+        """Fetch completed crypto order history from Robinhood."""
+        if not self._logged_in:
+            if not self.login():
+                return []
+
+        trades = []
+        try:
+            import robin_stocks.robinhood as rh
+
+            orders = rh.crypto.get_crypto_orders()
+            if not orders:
+                return []
+
+            for order in orders:
+                state = order.get("state", "")
+                if state not in ("filled",):
+                    continue
+
+                side_str = order.get("side", "").lower()
+                if side_str not in ("buy", "sell"):
+                    continue
+
+                quantity = float(order.get("cumulative_quantity", 0) or 0)
+                if quantity <= 0:
+                    continue
+
+                avg_price = float(order.get("average_price", 0) or 0)
+                if avg_price <= 0:
+                    continue
+
+                # Extract symbol from currency_pair_id or type field
+                symbol = "UNKNOWN"
+                # Try to get from the order's currency code
+                currency_code = order.get("currency_code", "")
+                if currency_code:
+                    symbol = currency_code.upper()
+                else:
+                    # Fallback: parse from the pair display name if available
+                    pair_id = order.get("currency_pair_id", "")
+                    if pair_id:
+                        symbol = pair_id.split("-")[0].upper() if "-" in pair_id else pair_id
+
+                # Parse timestamp
+                created_at = order.get("created_at", "")
+                try:
+                    ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    ts = datetime.now(timezone.utc)
+
+                total = quantity * avg_price
+                # Robinhood embeds fees in spread; explicit fee field may not exist
+                fee = float(order.get("fees", 0) or 0)
+
+                trades.append(Trade(
+                    id=order.get("id", ""),
+                    symbol=symbol,
+                    side=TradeSide.BUY if side_str == "buy" else TradeSide.SELL,
+                    quantity=quantity,
+                    price=avg_price,
+                    total=total,
+                    fee=fee,
+                    timestamp=ts,
+                    source="robinhood",
+                    asset_type="crypto",
+                    status=TradeStatus.FILLED,
+                    order_id=order.get("id", ""),
+                ))
+
+        except Exception as e:
+            logger.error(f"Error fetching Robinhood crypto orders: {e}")
+
+        return trades
+
+    def get_stock_order_history(self) -> list[Trade]:
+        """Fetch completed stock/ETF order history from Robinhood."""
+        if not self._logged_in:
+            if not self.login():
+                return []
+
+        trades = []
+        try:
+            import robin_stocks.robinhood as rh
+
+            orders = rh.orders.get_all_stock_orders()
+            if not orders:
+                return []
+
+            for order in orders:
+                state = order.get("state", "")
+                if state not in ("filled",):
+                    continue
+
+                side_str = order.get("side", "").lower()
+                if side_str not in ("buy", "sell"):
+                    continue
+
+                quantity = float(order.get("cumulative_quantity", 0) or 0)
+                if quantity <= 0:
+                    continue
+
+                avg_price = float(order.get("average_price", 0) or 0)
+                if avg_price <= 0:
+                    continue
+
+                # Get symbol from instrument URL
+                symbol = "UNKNOWN"
+                instrument_url = order.get("instrument", "")
+                if instrument_url:
+                    try:
+                        instrument_data = rh.stocks.get_instrument_by_url(instrument_url)
+                        symbol = instrument_data.get("symbol", "UNKNOWN")
+                    except Exception:
+                        pass
+
+                created_at = order.get("created_at", "")
+                try:
+                    ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    ts = datetime.now(timezone.utc)
+
+                total = quantity * avg_price
+                fee = float(order.get("fees", 0) or 0)
+
+                trades.append(Trade(
+                    id=order.get("id", ""),
+                    symbol=symbol,
+                    side=TradeSide.BUY if side_str == "buy" else TradeSide.SELL,
+                    quantity=quantity,
+                    price=avg_price,
+                    total=total,
+                    fee=fee,
+                    timestamp=ts,
+                    source="robinhood",
+                    asset_type="stock",
+                    status=TradeStatus.FILLED,
+                    order_id=order.get("id", ""),
+                ))
+
+        except Exception as e:
+            logger.error(f"Error fetching Robinhood stock orders: {e}")
+
+        return trades
+
+    def get_all_order_history(self) -> list[Trade]:
+        """Fetch all order history (crypto + stocks), sorted by time."""
+        trades = self.get_crypto_order_history()
+        trades.extend(self.get_stock_order_history())
+        trades.sort(key=lambda t: t.timestamp, reverse=True)
+        return trades
 
     def logout(self) -> None:
         """Log out of Robinhood."""
