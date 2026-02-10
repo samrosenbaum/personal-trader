@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     discord_webhook_url: str = ""
 
+    # Email alerts (SMTP — works with Gmail, Outlook, any SMTP server)
+    email_smtp_host: str = ""
+    email_smtp_port: int = 587
+    email_username: str = ""
+    email_password: str = ""
+    email_recipient: str = ""
+
     # General
     scan_interval: int = 300
     risk_profile: RiskProfile = RiskProfile.MODERATE

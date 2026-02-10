@@ -11,7 +11,7 @@ Fetches and analyses:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -59,12 +59,44 @@ class FundingSnapshot:
     predicted_rate: float | None
 
 
+class DirectionLabel(str, Enum):
+    STRONGLY_BEARISH = "strongly_bearish"
+    BEARISH = "bearish"
+    NEUTRAL = "neutral"
+    BULLISH = "bullish"
+    STRONGLY_BULLISH = "strongly_bullish"
+
+
+@dataclass
+class DirectionComponent:
+    """A single component contributing to the market direction index."""
+    name: str
+    raw_value: float | None
+    score: float
+    weight: float
+    description: str
+
+
+@dataclass
+class MarketDirectionIndex:
+    """Aggregated market direction index from -100 (bearish) to +100 (bullish)."""
+    score: float
+    label: DirectionLabel
+    components: list[DirectionComponent] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def label_display(self) -> str:
+        return self.label.value.replace("_", " ").upper()
+
+
 @dataclass
 class SentimentReport:
     fear_greed: FearGreedData | None = None
     market_overview: MarketOverview | None = None
     funding_rates: list[FundingSnapshot] | None = None
     trending_coins: list[str] | None = None
+    direction_index: MarketDirectionIndex | None = None
 
     @property
     def overall_sentiment(self) -> SentimentLevel:
@@ -166,6 +198,133 @@ class SentimentAnalyzer:
                 except Exception:
                     pass
         return results
+
+    def compute_market_direction_index(
+        self,
+        report: SentimentReport,
+        btc_technical_score: float | None = None,
+        eth_technical_score: float | None = None,
+    ) -> MarketDirectionIndex:
+        """Compute an aggregated market direction index from -100 to +100.
+
+        Combines five components:
+        1. Fear & Greed (contrarian-inverted) — 20%
+        2. BTC + ETH technical composite (bellwether) — 35%
+        3. Market cap 24h change direction — 15%
+        4. Funding rate pressure — 15%
+        5. BTC dominance trend — 15%
+        """
+        components: list[DirectionComponent] = []
+
+        # 1. Fear & Greed (contrarian) — weight 0.20
+        fg_score = 0.0
+        fg_raw = None
+        fg_desc = "Not available"
+        if report.fear_greed:
+            fg_raw = float(report.fear_greed.value)
+            fg_score = max(-100, min(100, (50 - fg_raw) * 2))
+            if fg_raw <= 25:
+                fg_desc = f"Extreme fear ({fg_raw:.0f}/100) = contrarian bullish"
+            elif fg_raw >= 75:
+                fg_desc = f"Extreme greed ({fg_raw:.0f}/100) = contrarian bearish"
+            else:
+                fg_desc = f"Fear & Greed at {fg_raw:.0f}/100 = neutral signal"
+        components.append(DirectionComponent(
+            name="Fear & Greed (contrarian)",
+            raw_value=fg_raw, score=fg_score, weight=0.20, description=fg_desc,
+        ))
+
+        # 2. BTC + ETH technical bellwether — weight 0.35
+        bw_score = 0.0
+        bw_raw = None
+        bw_desc = "Not available (no BTC/ETH technical data)"
+        if btc_technical_score is not None or eth_technical_score is not None:
+            btc_s = btc_technical_score or 0
+            eth_s = eth_technical_score or 0
+            if btc_technical_score is not None and eth_technical_score is not None:
+                bw_score = btc_s * 0.6 + eth_s * 0.4
+            elif btc_technical_score is not None:
+                bw_score = btc_s
+            else:
+                bw_score = eth_s
+            bw_raw = bw_score
+            direction = "bullish" if bw_score > 20 else "bearish" if bw_score < -20 else "neutral"
+            bw_desc = f"BTC+ETH technicals {direction} (score: {bw_score:+.0f})"
+        components.append(DirectionComponent(
+            name="BTC + ETH Bellwether",
+            raw_value=bw_raw, score=bw_score, weight=0.35, description=bw_desc,
+        ))
+
+        # 3. Market cap 24h change — weight 0.15
+        mcap_score = 0.0
+        mcap_raw = None
+        mcap_desc = "Not available"
+        if report.market_overview:
+            mcap_raw = report.market_overview.market_cap_change_24h
+            mcap_score = max(-100, min(100, mcap_raw * 20))
+            direction = "up" if mcap_raw > 0 else "down"
+            mcap_desc = f"Market cap 24h: {mcap_raw:+.2f}% ({direction})"
+        components.append(DirectionComponent(
+            name="Market Cap 24h Change",
+            raw_value=mcap_raw, score=mcap_score, weight=0.15, description=mcap_desc,
+        ))
+
+        # 4. Funding rate pressure — weight 0.15
+        fund_score = 0.0
+        fund_raw = None
+        fund_desc = "Not available (no funding data)"
+        if report.funding_rates:
+            avg_rate = sum(f.funding_rate for f in report.funding_rates) / len(report.funding_rates)
+            fund_raw = avg_rate
+            fund_score = max(-100, min(100, -avg_rate * 100000))
+            if avg_rate > 0.0005:
+                fund_desc = f"High positive funding ({avg_rate*100:.4f}%) = overleveraged longs"
+            elif avg_rate < -0.0005:
+                fund_desc = f"Negative funding ({avg_rate*100:.4f}%) = overleveraged shorts"
+            else:
+                fund_desc = f"Funding neutral ({avg_rate*100:.4f}%)"
+        components.append(DirectionComponent(
+            name="Funding Rate Pressure",
+            raw_value=fund_raw, score=fund_score, weight=0.15, description=fund_desc,
+        ))
+
+        # 5. BTC dominance trend — weight 0.15
+        dom_score = 0.0
+        dom_raw = None
+        dom_desc = "Not available"
+        if report.market_overview:
+            dom_raw = report.market_overview.btc_dominance
+            dom_score = max(-100, min(100, (50 - dom_raw) * 4))
+            if dom_raw > 55:
+                dom_desc = f"BTC dominance high ({dom_raw:.1f}%) = risk-off / bearish alts"
+            elif dom_raw < 45:
+                dom_desc = f"BTC dominance low ({dom_raw:.1f}%) = alt season / bullish"
+            else:
+                dom_desc = f"BTC dominance neutral ({dom_raw:.1f}%)"
+        components.append(DirectionComponent(
+            name="BTC Dominance Trend",
+            raw_value=dom_raw, score=dom_score, weight=0.15, description=dom_desc,
+        ))
+
+        # Weighted composite
+        total = max(-100, min(100, sum(c.score * c.weight for c in components)))
+
+        if total <= -60:
+            label = DirectionLabel.STRONGLY_BEARISH
+        elif total <= -20:
+            label = DirectionLabel.BEARISH
+        elif total < 20:
+            label = DirectionLabel.NEUTRAL
+        elif total < 60:
+            label = DirectionLabel.BULLISH
+        else:
+            label = DirectionLabel.STRONGLY_BULLISH
+
+        return MarketDirectionIndex(
+            score=round(total, 1),
+            label=label,
+            components=components,
+        )
 
     @staticmethod
     def _classify_fear_greed(value: int) -> SentimentLevel:

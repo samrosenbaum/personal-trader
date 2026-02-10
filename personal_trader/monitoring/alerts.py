@@ -1,10 +1,13 @@
-"""Alert dispatching via multiple channels (console, Telegram, Discord)."""
+"""Alert dispatching via multiple channels (console, Telegram, Discord, Email)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import smtplib
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import requests
 
@@ -41,6 +44,10 @@ class AlertDispatcher:
         # Discord
         if self.settings.discord_webhook_url:
             self._send_discord(message)
+
+        # Email
+        if self.settings.email_smtp_host and self.settings.email_recipient:
+            self._send_email(signal, message)
 
     def _format_signal(self, signal: Signal) -> str:
         lines = [
@@ -95,6 +102,98 @@ class AlertDispatcher:
             )
         except Exception as e:
             logger.error(f"Discord alert failed: {e}")
+
+    def _send_email(self, signal: Signal, plain_text: str) -> None:
+        """Send alert via SMTP email with HTML formatting."""
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = (
+                f"[{signal.urgency.value.upper()}] "
+                f"{signal.action.value.upper()} {signal.symbol}"
+            )
+            msg["From"] = self.settings.email_username
+            msg["To"] = self.settings.email_recipient
+
+            msg.attach(MIMEText(plain_text, "plain"))
+            msg.attach(MIMEText(self._format_email_html(signal), "html"))
+
+            with smtplib.SMTP(
+                self.settings.email_smtp_host,
+                self.settings.email_smtp_port,
+                timeout=15,
+            ) as server:
+                server.starttls()
+                server.login(
+                    self.settings.email_username,
+                    self.settings.email_password,
+                )
+                server.send_message(msg)
+
+            logger.info(f"Email alert sent to {self.settings.email_recipient}")
+        except Exception as e:
+            logger.error(f"Email alert failed: {e}")
+
+    def _format_email_html(self, signal: Signal) -> str:
+        """Build an HTML email body from a Signal."""
+        action_colors = {
+            "strong_buy": "#22c55e", "buy": "#4ade80",
+            "hold": "#eab308",
+            "sell": "#f87171", "strong_sell": "#ef4444",
+            "move_to_stablecoin": "#c084fc",
+            "hedge_with_futures": "#22d3ee",
+            "sell_puts": "#60a5fa", "buy_puts": "#a78bfa",
+        }
+        urgency_colors = {
+            "immediate": "#ef4444", "high": "#f87171",
+            "medium": "#eab308", "low": "#4ade80",
+        }
+        action_color = action_colors.get(signal.action.value, "#ffffff")
+        urgency_color = urgency_colors.get(signal.urgency.value, "#ffffff")
+
+        reasons_html = "".join(f"<li>{r}</li>" for r in signal.reasons)
+
+        price_rows = ""
+        if signal.entry_price:
+            price_rows += (
+                f'<tr><td style="padding:4px 8px;font-weight:bold;">Entry</td>'
+                f'<td style="padding:4px 8px;">${signal.entry_price:,.2f}</td></tr>'
+            )
+        if signal.stop_loss:
+            price_rows += (
+                f'<tr><td style="padding:4px 8px;font-weight:bold;">Stop Loss</td>'
+                f'<td style="padding:4px 8px;">${signal.stop_loss:,.2f}</td></tr>'
+            )
+        if signal.take_profit:
+            price_rows += (
+                f'<tr><td style="padding:4px 8px;font-weight:bold;">Take Profit</td>'
+                f'<td style="padding:4px 8px;">${signal.take_profit:,.2f}</td></tr>'
+            )
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        return f"""<html><body style="font-family:Arial,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px;">
+<div style="max-width:600px;margin:0 auto;background:#16213e;border-radius:8px;padding:20px;">
+  <h2 style="margin:0 0 16px;color:#e0e0e0;">Trading Alert: {signal.symbol}</h2>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+    <tr>
+      <td style="padding:4px 8px;font-weight:bold;">Action</td>
+      <td style="padding:4px 8px;"><span style="color:{action_color};font-weight:bold;">{signal.action.value.upper()}</span></td>
+    </tr>
+    <tr>
+      <td style="padding:4px 8px;font-weight:bold;">Urgency</td>
+      <td style="padding:4px 8px;"><span style="color:{urgency_color};font-weight:bold;">{signal.urgency.value.upper()}</span></td>
+    </tr>
+    <tr>
+      <td style="padding:4px 8px;font-weight:bold;">Confidence</td>
+      <td style="padding:4px 8px;">{signal.confidence:.0%}</td>
+    </tr>
+    {price_rows}
+  </table>
+  <h3 style="color:#e0e0e0;margin:12px 0 8px;">Reasons</h3>
+  <ul style="margin:0;padding-left:20px;">{reasons_html}</ul>
+  <p style="color:#888;font-size:12px;margin-top:16px;">{timestamp} | personal-trader</p>
+</div>
+</body></html>"""
 
     def clear_cache(self) -> None:
         """Clear the sent-alerts cache (allow re-sending)."""

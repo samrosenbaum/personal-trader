@@ -8,6 +8,7 @@ Commands:
     trader analyze BTC     - Deep analysis of a specific asset
     trader signals         - Show latest trading signals
     trader history         - View trade history and realized P&L
+    trader market          - Crypto Market Direction Index (bullish/bearish score)
     trader derivatives     - Show derivatives strategy recommendations
     trader config          - Show current configuration
 """
@@ -1037,6 +1038,146 @@ def sentiment() -> None:
             )
         console.print(ftable)
 
+    # Market Direction Index (summary)
+    try:
+        from personal_trader.analysis.technical import compute_multi_timeframe
+
+        btc_score = None
+        eth_score = None
+        for sym, lbl in [("BTC/USDT", "BTC"), ("ETH/USDT", "ETH")]:
+            try:
+                tf_data = compute_multi_timeframe(
+                    fetch_fn=em.fetch_ohlcv, symbol=sym, timeframes=["1h", "4h", "1d"],
+                )
+                if tf_data:
+                    scores = scanner.signal_gen._score_technical(tf_data)
+                    if lbl == "BTC":
+                        btc_score = scores["composite"]
+                    else:
+                        eth_score = scores["composite"]
+            except Exception:
+                pass
+
+        idx = scanner.sentiment_analyzer.compute_market_direction_index(
+            report=report, btc_technical_score=btc_score, eth_technical_score=eth_score,
+        )
+        idx_color = (
+            "bold red" if idx.score < -60
+            else "red" if idx.score < -20
+            else "yellow" if idx.score < 20
+            else "green" if idx.score < 60
+            else "bold green"
+        )
+        console.print(Panel(
+            f"[{idx_color}]{idx.score:+.1f} -- {idx.label_display}[/{idx_color}]\n"
+            f"[dim]Run 'trader market' for full component breakdown[/dim]",
+            title="Market Direction Index",
+        ))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# market direction index
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+def market() -> None:
+    """Show the aggregated Crypto Market Direction Index."""
+    settings, em, scanner = _get_components()
+
+    console.print(Panel("Computing Market Direction Index...", style="bold cyan"))
+
+    # Fetch sentiment data
+    report = scanner.sentiment_analyzer.get_full_report()
+
+    # Fetch BTC and ETH technical scores
+    from personal_trader.analysis.technical import compute_multi_timeframe
+
+    btc_score = None
+    eth_score = None
+    for sym, lbl in [("BTC/USDT", "BTC"), ("ETH/USDT", "ETH")]:
+        try:
+            tf_data = compute_multi_timeframe(
+                fetch_fn=em.fetch_ohlcv, symbol=sym, timeframes=["1h", "4h", "1d"],
+            )
+            if tf_data:
+                scores = scanner.signal_gen._score_technical(tf_data)
+                if lbl == "BTC":
+                    btc_score = scores["composite"]
+                else:
+                    eth_score = scores["composite"]
+                console.print(f"  {lbl} technical score: {scores['composite']:+.1f}")
+        except Exception as e:
+            console.print(f"  [dim]Could not fetch {lbl} data: {e}[/dim]")
+
+    # Compute index
+    idx = scanner.sentiment_analyzer.compute_market_direction_index(
+        report=report,
+        btc_technical_score=btc_score,
+        eth_technical_score=eth_score,
+    )
+
+    # Color based on score
+    score_color = (
+        "bold red" if idx.score < -60
+        else "red" if idx.score < -20
+        else "yellow" if idx.score < 20
+        else "green" if idx.score < 60
+        else "bold green"
+    )
+
+    # Visual gauge
+    gauge_pos = int((idx.score + 100) / 200 * 40)
+    gauge_pos = max(0, min(40, gauge_pos))
+    gauge = (
+        "[dim]" + "-" * gauge_pos + "[/dim]"
+        + f"[{score_color}]|[/{score_color}]"
+        + "[dim]" + "-" * (40 - gauge_pos) + "[/dim]"
+    )
+
+    console.print(Panel(
+        f"[{score_color}]{idx.score:+.1f} / 100  --  {idx.label_display}[/{score_color}]\n\n"
+        f"  -100 {gauge} +100\n"
+        f"  BEAR {'':>16} NEUTRAL {'':>14} BULL",
+        title="Crypto Market Direction Index",
+        style=score_color,
+    ))
+
+    # Component breakdown table
+    table = Table(title="Index Components", show_lines=True)
+    table.add_column("Component", style="bold")
+    table.add_column("Raw Value", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("Weight", justify="right")
+    table.add_column("Weighted", justify="right")
+    table.add_column("Description")
+
+    for c in idx.components:
+        comp_color = "green" if c.score > 10 else "red" if c.score < -10 else "yellow"
+        if c.raw_value is not None:
+            raw_display = (
+                f"{c.raw_value:.4f}" if abs(c.raw_value) < 1
+                else f"{c.raw_value:.1f}"
+            )
+        else:
+            raw_display = "N/A"
+        weighted = c.score * c.weight
+        table.add_row(
+            c.name,
+            raw_display,
+            Text(f"{c.score:+.1f}", style=comp_color),
+            f"{c.weight:.0%}",
+            Text(f"{weighted:+.1f}", style=comp_color),
+            c.description[:60],
+        )
+
+    console.print(table)
+    console.print(
+        f"\n[dim]Computed at {idx.timestamp.strftime('%Y-%m-%d %H:%M UTC')}[/dim]"
+    )
+
 
 # ---------------------------------------------------------------------------
 # config
@@ -1073,6 +1214,8 @@ def show_config() -> None:
     table.add_row("", "")
     table.add_row("Telegram", mask(settings.telegram_bot_token))
     table.add_row("Discord", mask(settings.discord_webhook_url))
+    table.add_row("Email", mask(settings.email_username))
+    table.add_row("Email Recipient", mask(settings.email_recipient))
 
     console.print(table)
 

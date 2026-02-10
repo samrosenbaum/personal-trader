@@ -18,7 +18,7 @@ from personal_trader.analysis.microstructure import (
     volume_profile,
 )
 from personal_trader.analysis.patterns import PatternDetector
-from personal_trader.analysis.sentiment import SentimentAnalyzer
+from personal_trader.analysis.sentiment import MarketDirectionIndex, SentimentAnalyzer
 from personal_trader.analysis.technical import compute_multi_timeframe
 from personal_trader.config import Settings
 from personal_trader.exchanges.manager import ExchangeManager
@@ -36,6 +36,7 @@ class ScanResult:
     timestamp: datetime
     signals: list[Signal] = field(default_factory=list)
     price: float = 0.0
+    technical_score: float | None = None
 
 
 @dataclass
@@ -45,6 +46,7 @@ class ScanCycle:
     portfolio_value: float = 0.0
     actionable_count: int = 0
     errors: list[str] = field(default_factory=list)
+    direction_index: MarketDirectionIndex | None = None
 
 
 class MarketScanner:
@@ -125,6 +127,29 @@ class MarketScanner:
                 cycle.errors.append(f"{symbol}: {e}")
                 logger.error(f"Error scanning {symbol}: {e}")
 
+        # Compute market direction index
+        if sentiment:
+            btc_score = None
+            eth_score = None
+            for r in cycle.results:
+                base = r.symbol.split("/")[0].upper()
+                if base == "BTC" and r.technical_score is not None:
+                    btc_score = r.technical_score
+                elif base == "ETH" and r.technical_score is not None:
+                    eth_score = r.technical_score
+            try:
+                cycle.direction_index = self.sentiment_analyzer.compute_market_direction_index(
+                    report=sentiment,
+                    btc_technical_score=btc_score,
+                    eth_technical_score=eth_score,
+                )
+                logger.info(
+                    f"Market Direction: {cycle.direction_index.score:+.1f} "
+                    f"({cycle.direction_index.label_display})"
+                )
+            except Exception as e:
+                cycle.errors.append(f"Direction index failed: {e}")
+
         # Dispatch alerts for urgent signals
         if self.alert_dispatcher:
             urgent = [
@@ -195,6 +220,13 @@ class MarketScanner:
         if base in ("BTC", "ETH"):
             vol_surf = self._get_cached_vol_surface(base)
             fut_basis = self._get_cached_futures_basis(base)
+
+        # Cache technical composite score for direction index
+        try:
+            ta_scores = self.signal_gen._score_technical(tf_data)
+            result.technical_score = ta_scores.get("composite")
+        except Exception:
+            pass
 
         # Generate signals
         signals = self.signal_gen.generate(
