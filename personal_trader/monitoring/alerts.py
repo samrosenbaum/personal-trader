@@ -45,9 +45,11 @@ class AlertDispatcher:
         if self.settings.discord_webhook_url:
             self._send_discord(message)
 
-        # Email
-        if self.settings.email_smtp_host and self.settings.email_recipient:
-            self._send_email(signal, message)
+        # Email (Resend API takes priority, falls back to SMTP)
+        if self.settings.resend_api_key and self.settings.email_recipient:
+            self._send_resend(signal, message)
+        elif self.settings.email_smtp_host and self.settings.email_recipient:
+            self._send_email_smtp(signal, message)
 
     def _format_signal(self, signal: Signal) -> str:
         lines = [
@@ -103,7 +105,36 @@ class AlertDispatcher:
         except Exception as e:
             logger.error(f"Discord alert failed: {e}")
 
-    def _send_email(self, signal: Signal, plain_text: str) -> None:
+    def _send_resend(self, signal: Signal, plain_text: str) -> None:
+        """Send alert via Resend API (https://resend.com)."""
+        try:
+            subject = (
+                f"[{signal.urgency.value.upper()}] "
+                f"{signal.action.value.upper()} {signal.symbol}"
+            )
+            resp = self.session.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {self.settings.resend_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": self.settings.email_from,
+                    "to": [self.settings.email_recipient],
+                    "subject": subject,
+                    "html": self._format_email_html(signal),
+                    "text": plain_text,
+                },
+                timeout=10,
+            )
+            if resp.status_code < 300:
+                logger.info(f"Resend alert sent to {self.settings.email_recipient}")
+            else:
+                logger.error(f"Resend alert failed ({resp.status_code}): {resp.text}")
+        except Exception as e:
+            logger.error(f"Resend alert failed: {e}")
+
+    def _send_email_smtp(self, signal: Signal, plain_text: str) -> None:
         """Send alert via SMTP email with HTML formatting."""
         try:
             msg = MIMEMultipart("alternative")

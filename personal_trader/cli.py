@@ -1214,8 +1214,9 @@ def show_config() -> None:
     table.add_row("", "")
     table.add_row("Telegram", mask(settings.telegram_bot_token))
     table.add_row("Discord", mask(settings.discord_webhook_url))
-    table.add_row("Email", mask(settings.email_username))
-    table.add_row("Email Recipient", mask(settings.email_recipient))
+    table.add_row("Resend API", mask(settings.resend_api_key))
+    email_via = "Resend" if settings.resend_api_key else ("SMTP" if settings.email_smtp_host else "")
+    table.add_row("Email Recipient", mask(settings.email_recipient) + (f" (via {email_via})" if email_via else ""))
 
     console.print(table)
 
