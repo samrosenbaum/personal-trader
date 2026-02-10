@@ -32,6 +32,9 @@ dev = [
 [project.scripts]
 trader = "personal_trader.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["personal_trader*"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
