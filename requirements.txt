@@ -1,2 +1,6 @@
-# API endpoint dependencies only (CLI deps are in pyproject.toml)
+# API endpoint dependencies (CLI deps are in pyproject.toml)
 # Keep this minimal — Vercel serverless functions have a 250MB size limit
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+ta>=0.11.0

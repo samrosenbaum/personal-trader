@@ -32,7 +32,10 @@ class handler(BaseHTTPRequestHandler):
             "configured_exchanges": configured_exchanges,
             "endpoints": {
                 "/api/health": "Health check",
-                "/api/portfolio": "Portfolio summary (coming soon)",
+                "/api/portfolio": "Portfolio holdings, value, risk assessment",
+                "/api/sentiment": "Market sentiment, fear/greed, direction index",
+                "/api/signals": "Trading signals from technical analysis",
+                "/api/opportunities": "Actionable opportunities for held positions",
             },
         }, indent=2)
 
