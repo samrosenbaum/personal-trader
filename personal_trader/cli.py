@@ -7,6 +7,8 @@ Commands:
     trader opportunities   - What can I do with what I hold to make money?
     trader analyze BTC     - Deep analysis of a specific asset
     trader signals         - Show latest trading signals
+    trader history         - View trade history and realized P&L
+    trader market          - Crypto Market Direction Index (bullish/bearish score)
     trader derivatives     - Show derivatives strategy recommendations
     trader config          - Show current configuration
 """
@@ -306,7 +308,12 @@ def portfolio() -> None:
 
     # --- Risk analysis ---
     risk_mgr = RiskManager(settings.risk_profile)
-    report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd)
+    cost_basis = {}
+    try:
+        cost_basis = em.get_cost_basis()
+    except Exception:
+        pass
+    report = risk_mgr.analyze_portfolio(pf.balances, pf.total_usd, cost_basis=cost_basis)
 
     risk_table = Table(title="Risk Analysis")
     risk_table.add_column("Metric", style="bold")
@@ -322,7 +329,16 @@ def portfolio() -> None:
     risk_table.add_row("Top Concentration", f"{report.top_concentration_pct:.1f}%")
     if report.portfolio_volatility:
         risk_table.add_row("Portfolio Volatility", f"{report.portfolio_volatility:.1f}%")
+    if report.var_95:
+        risk_table.add_row("VaR 95% (1d)", f"${report.var_95:,.0f}")
+    if report.cvar_95:
+        risk_table.add_row("CVaR 95% (1d)", f"${report.cvar_95:,.0f}")
     console.print(risk_table)
+
+    if report.stress_tests:
+        console.print("\n[bold]Stress Tests:[/bold]")
+        for scenario in report.stress_tests:
+            console.print(f"  - {scenario}")
 
     if report.warnings:
         console.print("\n[bold red]Warnings:[/bold red]")
@@ -413,6 +429,13 @@ def opportunities() -> None:
             })
         cash_total += rh_portfolio.cash_balance
 
+    # Fetch cost basis from trade history for exchange positions
+    cost_basis = {}
+    try:
+        cost_basis = em.get_cost_basis()
+    except Exception as e:
+        console.print(f"  [dim]Could not fetch trade history for cost basis: {e}[/dim]")
+
     # Exchange holdings
     for source, balances in pf.exchange_breakdown.items():
         if source == "robinhood":
@@ -426,13 +449,26 @@ def opportunities() -> None:
                 if existing:
                     existing["value"] += value
                 else:
+                    # Use cost basis from trade history if available
+                    avg_cost = cost_basis.get(asset, 0)
+                    # Estimate quantity and current price from value
+                    current_price = 0.0
+                    quantity = 0.0
+                    try:
+                        ticker = em.fetch_ticker(f"{asset}/USDT")
+                        current_price = ticker["last"]
+                        quantity = value / current_price if current_price > 0 else 0
+                    except Exception:
+                        pass
+                    pnl_pct = ((current_price - avg_cost) / avg_cost * 100) if avg_cost > 0 and current_price > 0 else 0
+
                     holdings.append({
                         "symbol": asset,
                         "value": value,
-                        "quantity": 0,
-                        "avg_cost": 0,
-                        "current_price": 0,
-                        "unrealized_pnl_pct": 0,
+                        "quantity": quantity,
+                        "avg_cost": avg_cost,
+                        "current_price": current_price,
+                        "unrealized_pnl_pct": pnl_pct,
                         "asset_type": "crypto",
                         "source": source,
                     })
@@ -729,6 +765,123 @@ def signals() -> None:
 
 
 # ---------------------------------------------------------------------------
+# history
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--symbol", "-s", default=None, help="Filter by symbol (e.g. BTC)")
+@click.option("--days", "-d", default=90, type=int, help="Days of history to fetch")
+@click.option("--source", default=None, help="Filter by source (robinhood, coinbase, etc.)")
+@click.option("--limit", "-l", default=30, type=int, help="Number of recent trades to show")
+def history(symbol: str | None, days: int, source: str | None, limit: int) -> None:
+    """View trade history and realized P&L across all accounts."""
+    from datetime import datetime, timedelta, timezone
+
+    settings, em, _scanner = _get_components()
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    console.print(Panel(f"Fetching trade history (last {days} days)...", style="bold cyan"))
+
+    trade_history = em.get_trade_history(since=since)
+
+    if not trade_history.trades:
+        console.print("[yellow]No trades found. Check your API credentials and connections.[/yellow]")
+        return
+
+    trades = trade_history.trades
+
+    # Apply filters
+    if symbol:
+        symbol_upper = symbol.upper()
+        trades = [t for t in trades if t.symbol == symbol_upper]
+    if source:
+        source_lower = source.lower()
+        trades = [t for t in trades if t.source == source_lower]
+
+    # --- Realized P&L Summary ---
+    pnl_data = trade_history.realized_pnl
+    if symbol:
+        pnl_data = {k: v for k, v in pnl_data.items() if k == symbol.upper()}
+
+    if pnl_data:
+        pnl_table = Table(title="Realized P&L Summary", show_lines=True)
+        pnl_table.add_column("Symbol", style="bold")
+        pnl_table.add_column("Realized P&L", justify="right")
+        pnl_table.add_column("P&L %", justify="right")
+        pnl_table.add_column("Cost Basis", justify="right")
+        pnl_table.add_column("Proceeds", justify="right")
+        pnl_table.add_column("Avg Buy", justify="right")
+        pnl_table.add_column("Avg Sell", justify="right")
+        pnl_table.add_column("Trades", justify="right")
+
+        for sym, pnl in sorted(pnl_data.items(), key=lambda x: abs(x[1].total_realized_pnl), reverse=True):
+            pnl_color = "green" if pnl.total_realized_pnl >= 0 else "red"
+            pnl_table.add_row(
+                sym,
+                Text(f"${pnl.total_realized_pnl:+,.2f}", style=pnl_color),
+                Text(f"{pnl.pnl_pct:+.1f}%", style=pnl_color),
+                f"${pnl.total_cost_basis:,.2f}",
+                f"${pnl.total_proceeds:,.2f}",
+                f"${pnl.avg_buy_price:,.2f}",
+                f"${pnl.avg_sell_price:,.2f}",
+                str(pnl.trade_count),
+            )
+
+        console.print(pnl_table)
+        console.print()
+
+    # --- Recent Trades ---
+    recent = sorted(trades, key=lambda t: t.timestamp, reverse=True)[:limit]
+
+    if recent:
+        trade_table = Table(title=f"Recent Trades (showing {len(recent)})", show_lines=True)
+        trade_table.add_column("Date", style="dim")
+        trade_table.add_column("Symbol", style="bold")
+        trade_table.add_column("Side", justify="center")
+        trade_table.add_column("Quantity", justify="right")
+        trade_table.add_column("Price", justify="right")
+        trade_table.add_column("Total", justify="right")
+        trade_table.add_column("Fee", justify="right")
+        trade_table.add_column("Source")
+
+        for t in recent:
+            side_color = "green" if t.side.value == "buy" else "red"
+            trade_table.add_row(
+                t.timestamp.strftime("%Y-%m-%d %H:%M"),
+                t.symbol,
+                Text(t.side.value.upper(), style=side_color),
+                f"{t.quantity:.6f}",
+                f"${t.price:,.2f}",
+                f"${t.total:,.2f}",
+                f"${t.fee:.2f}" if t.fee > 0 else "-",
+                t.source.title(),
+            )
+
+        console.print(trade_table)
+
+    # --- Summary ---
+    total_pnl_color = "green" if trade_history.total_realized_pnl >= 0 else "red"
+    summary_lines = [
+        f"Total trades: {len(trades)}",
+        f"Total realized P&L: [{total_pnl_color}]${trade_history.total_realized_pnl:+,.2f}[/{total_pnl_color}]",
+        f"Total fees paid: ${trade_history.total_fees:,.2f}",
+    ]
+
+    # Show current cost basis
+    cost_basis = em.get_cost_basis()
+    if cost_basis:
+        cb_filtered = cost_basis if not symbol else {k: v for k, v in cost_basis.items() if k == symbol.upper()}
+        if cb_filtered:
+            summary_lines.append("")
+            summary_lines.append("[bold]Current Cost Basis (avg per unit):[/bold]")
+            for sym, avg_cost in sorted(cb_filtered.items()):
+                summary_lines.append(f"  {sym}: ${avg_cost:,.2f}")
+
+    console.print(Panel("\n".join(summary_lines), title="Summary", border_style="cyan"))
+
+
+# ---------------------------------------------------------------------------
 # derivatives
 # ---------------------------------------------------------------------------
 
@@ -885,6 +1038,146 @@ def sentiment() -> None:
             )
         console.print(ftable)
 
+    # Market Direction Index (summary)
+    try:
+        from personal_trader.analysis.technical import compute_multi_timeframe
+
+        btc_score = None
+        eth_score = None
+        for sym, lbl in [("BTC/USDT", "BTC"), ("ETH/USDT", "ETH")]:
+            try:
+                tf_data = compute_multi_timeframe(
+                    fetch_fn=em.fetch_ohlcv, symbol=sym, timeframes=["1h", "4h", "1d"],
+                )
+                if tf_data:
+                    scores = scanner.signal_gen._score_technical(tf_data)
+                    if lbl == "BTC":
+                        btc_score = scores["composite"]
+                    else:
+                        eth_score = scores["composite"]
+            except Exception:
+                pass
+
+        idx = scanner.sentiment_analyzer.compute_market_direction_index(
+            report=report, btc_technical_score=btc_score, eth_technical_score=eth_score,
+        )
+        idx_color = (
+            "bold red" if idx.score < -60
+            else "red" if idx.score < -20
+            else "yellow" if idx.score < 20
+            else "green" if idx.score < 60
+            else "bold green"
+        )
+        console.print(Panel(
+            f"[{idx_color}]{idx.score:+.1f} -- {idx.label_display}[/{idx_color}]\n"
+            f"[dim]Run 'trader market' for full component breakdown[/dim]",
+            title="Market Direction Index",
+        ))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# market direction index
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+def market() -> None:
+    """Show the aggregated Crypto Market Direction Index."""
+    settings, em, scanner = _get_components()
+
+    console.print(Panel("Computing Market Direction Index...", style="bold cyan"))
+
+    # Fetch sentiment data
+    report = scanner.sentiment_analyzer.get_full_report()
+
+    # Fetch BTC and ETH technical scores
+    from personal_trader.analysis.technical import compute_multi_timeframe
+
+    btc_score = None
+    eth_score = None
+    for sym, lbl in [("BTC/USDT", "BTC"), ("ETH/USDT", "ETH")]:
+        try:
+            tf_data = compute_multi_timeframe(
+                fetch_fn=em.fetch_ohlcv, symbol=sym, timeframes=["1h", "4h", "1d"],
+            )
+            if tf_data:
+                scores = scanner.signal_gen._score_technical(tf_data)
+                if lbl == "BTC":
+                    btc_score = scores["composite"]
+                else:
+                    eth_score = scores["composite"]
+                console.print(f"  {lbl} technical score: {scores['composite']:+.1f}")
+        except Exception as e:
+            console.print(f"  [dim]Could not fetch {lbl} data: {e}[/dim]")
+
+    # Compute index
+    idx = scanner.sentiment_analyzer.compute_market_direction_index(
+        report=report,
+        btc_technical_score=btc_score,
+        eth_technical_score=eth_score,
+    )
+
+    # Color based on score
+    score_color = (
+        "bold red" if idx.score < -60
+        else "red" if idx.score < -20
+        else "yellow" if idx.score < 20
+        else "green" if idx.score < 60
+        else "bold green"
+    )
+
+    # Visual gauge
+    gauge_pos = int((idx.score + 100) / 200 * 40)
+    gauge_pos = max(0, min(40, gauge_pos))
+    gauge = (
+        "[dim]" + "-" * gauge_pos + "[/dim]"
+        + f"[{score_color}]|[/{score_color}]"
+        + "[dim]" + "-" * (40 - gauge_pos) + "[/dim]"
+    )
+
+    console.print(Panel(
+        f"[{score_color}]{idx.score:+.1f} / 100  --  {idx.label_display}[/{score_color}]\n\n"
+        f"  -100 {gauge} +100\n"
+        f"  BEAR {'':>16} NEUTRAL {'':>14} BULL",
+        title="Crypto Market Direction Index",
+        style=score_color,
+    ))
+
+    # Component breakdown table
+    table = Table(title="Index Components", show_lines=True)
+    table.add_column("Component", style="bold")
+    table.add_column("Raw Value", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("Weight", justify="right")
+    table.add_column("Weighted", justify="right")
+    table.add_column("Description")
+
+    for c in idx.components:
+        comp_color = "green" if c.score > 10 else "red" if c.score < -10 else "yellow"
+        if c.raw_value is not None:
+            raw_display = (
+                f"{c.raw_value:.4f}" if abs(c.raw_value) < 1
+                else f"{c.raw_value:.1f}"
+            )
+        else:
+            raw_display = "N/A"
+        weighted = c.score * c.weight
+        table.add_row(
+            c.name,
+            raw_display,
+            Text(f"{c.score:+.1f}", style=comp_color),
+            f"{c.weight:.0%}",
+            Text(f"{weighted:+.1f}", style=comp_color),
+            c.description[:60],
+        )
+
+    console.print(table)
+    console.print(
+        f"\n[dim]Computed at {idx.timestamp.strftime('%Y-%m-%d %H:%M UTC')}[/dim]"
+    )
+
 
 # ---------------------------------------------------------------------------
 # config
@@ -921,6 +1214,9 @@ def show_config() -> None:
     table.add_row("", "")
     table.add_row("Telegram", mask(settings.telegram_bot_token))
     table.add_row("Discord", mask(settings.discord_webhook_url))
+    table.add_row("Resend API", mask(settings.resend_api_key))
+    email_via = "Resend" if settings.resend_api_key else ("SMTP" if settings.email_smtp_host else "")
+    table.add_row("Email Recipient", mask(settings.email_recipient) + (f" (via {email_via})" if email_via else ""))
 
     console.print(table)
 

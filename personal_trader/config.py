@@ -49,6 +49,17 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     discord_webhook_url: str = ""
 
+    # Email alerts — Option A: Resend (recommended, just an API key)
+    resend_api_key: str = ""
+    email_from: str = "alerts@personal-trader.dev"  # Resend verified sender
+    email_recipient: str = ""
+
+    # Email alerts — Option B: SMTP (Gmail, Outlook, etc.)
+    email_smtp_host: str = ""
+    email_smtp_port: int = 587
+    email_username: str = ""
+    email_password: str = ""
+
     # General
     scan_interval: int = 300
     risk_profile: RiskProfile = RiskProfile.MODERATE

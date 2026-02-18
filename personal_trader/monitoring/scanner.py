@@ -11,9 +11,15 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from personal_trader.analysis.derivatives_market import fetch_futures_basis, fetch_vol_surface
+from personal_trader.analysis.microstructure import (
+    anchored_vwap,
+    analyze_order_book,
+    volume_profile,
+)
 from personal_trader.analysis.patterns import PatternDetector
-from personal_trader.analysis.sentiment import SentimentAnalyzer
-from personal_trader.analysis.technical import add_all_indicators, compute_multi_timeframe
+from personal_trader.analysis.sentiment import MarketDirectionIndex, SentimentAnalyzer
+from personal_trader.analysis.technical import compute_multi_timeframe
 from personal_trader.config import Settings
 from personal_trader.exchanges.manager import ExchangeManager
 from personal_trader.monitoring.alerts import AlertDispatcher
@@ -30,6 +36,7 @@ class ScanResult:
     timestamp: datetime
     signals: list[Signal] = field(default_factory=list)
     price: float = 0.0
+    technical_score: float | None = None
 
 
 @dataclass
@@ -39,6 +46,7 @@ class ScanCycle:
     portfolio_value: float = 0.0
     actionable_count: int = 0
     errors: list[str] = field(default_factory=list)
+    direction_index: MarketDirectionIndex | None = None
 
 
 class MarketScanner:
@@ -64,6 +72,8 @@ class MarketScanner:
         self.alert_dispatcher = alert_dispatcher
         self.watchlist = list(self.DEFAULT_WATCHLIST)
         self._last_scan: ScanCycle | None = None
+        self._vol_surface_cache: dict[str, tuple[object, datetime]] = {}
+        self._futures_basis_cache: dict[str, tuple[object, datetime]] = {}
 
     def add_to_watchlist(self, symbol: str) -> None:
         if symbol not in self.watchlist:
@@ -102,7 +112,7 @@ class MarketScanner:
 
         for symbol in symbols_to_scan:
             try:
-                result = self._scan_symbol(symbol, sentiment)
+                result = self._scan_symbol(symbol, sentiment, cycle.portfolio_value)
                 cycle.results.append(result)
 
                 # Count actionable signals
@@ -116,6 +126,29 @@ class MarketScanner:
             except Exception as e:
                 cycle.errors.append(f"{symbol}: {e}")
                 logger.error(f"Error scanning {symbol}: {e}")
+
+        # Compute market direction index
+        if sentiment:
+            btc_score = None
+            eth_score = None
+            for r in cycle.results:
+                base = r.symbol.split("/")[0].upper()
+                if base == "BTC" and r.technical_score is not None:
+                    btc_score = r.technical_score
+                elif base == "ETH" and r.technical_score is not None:
+                    eth_score = r.technical_score
+            try:
+                cycle.direction_index = self.sentiment_analyzer.compute_market_direction_index(
+                    report=sentiment,
+                    btc_technical_score=btc_score,
+                    eth_technical_score=eth_score,
+                )
+                logger.info(
+                    f"Market Direction: {cycle.direction_index.score:+.1f} "
+                    f"({cycle.direction_index.label_display})"
+                )
+            except Exception as e:
+                cycle.errors.append(f"Direction index failed: {e}")
 
         # Dispatch alerts for urgent signals
         if self.alert_dispatcher:
@@ -131,7 +164,12 @@ class MarketScanner:
         self._last_scan = cycle
         return cycle
 
-    def _scan_symbol(self, symbol: str, sentiment=None) -> ScanResult:
+    def _scan_symbol(
+        self,
+        symbol: str,
+        sentiment=None,
+        portfolio_value: float | None = None,
+    ) -> ScanResult:
         """Scan a single symbol across multiple timeframes."""
         result = ScanResult(
             symbol=symbol,
@@ -163,12 +201,45 @@ class MarketScanner:
             except Exception:
                 pass
 
+        # Microstructure
+        micro = None
+        try:
+            order_book = self.exchange_manager.fetch_order_book(symbol)
+            micro = analyze_order_book(order_book)
+        except Exception:
+            pass
+
+        # Volume profile + anchored VWAP
+        profile = volume_profile(tf_data.get("1d")) if "1d" in tf_data else None
+        anchored = anchored_vwap(tf_data.get("1d")) if "1d" in tf_data else None
+
+        # Derivatives data (only for major assets to avoid API spam)
+        base = symbol.split("/")[0].upper()
+        vol_surf = None
+        fut_basis = None
+        if base in ("BTC", "ETH"):
+            vol_surf = self._get_cached_vol_surface(base)
+            fut_basis = self._get_cached_futures_basis(base)
+
+        # Cache technical composite score for direction index
+        try:
+            ta_scores = self.signal_gen._score_technical(tf_data)
+            result.technical_score = ta_scores.get("composite")
+        except Exception:
+            pass
+
         # Generate signals
         signals = self.signal_gen.generate(
             symbol=symbol,
             indicators=tf_data,
             patterns=patterns,
             sentiment=sentiment,
+            microstructure=micro,
+            volume_profile=profile,
+            anchored_vwap=anchored,
+            vol_surface=vol_surf,
+            futures_basis=fut_basis,
+            portfolio_value=portfolio_value,
         )
         result.signals = signals
 
@@ -202,3 +273,23 @@ class MarketScanner:
     @property
     def last_scan(self) -> ScanCycle | None:
         return self._last_scan
+
+    def _get_cached_vol_surface(self, asset: str):
+        now = datetime.now(timezone.utc)
+        cached = self._vol_surface_cache.get(asset)
+        if cached and (now - cached[1]).seconds < 3600:
+            return cached[0]
+        surface = fetch_vol_surface(asset)
+        if surface:
+            self._vol_surface_cache[asset] = (surface, now)
+        return surface
+
+    def _get_cached_futures_basis(self, asset: str):
+        now = datetime.now(timezone.utc)
+        cached = self._futures_basis_cache.get(asset)
+        if cached and (now - cached[1]).seconds < 600:
+            return cached[0]
+        basis = fetch_futures_basis(asset)
+        if basis:
+            self._futures_basis_cache[asset] = (basis, now)
+        return basis

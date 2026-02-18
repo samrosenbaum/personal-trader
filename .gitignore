@@ -10,3 +10,4 @@ dist/
 data/*.json
 data/*.csv
 logs/
+.vercel
