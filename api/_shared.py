@@ -5,6 +5,7 @@ NOT a serverless function itself (underscore prefix).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -112,11 +113,15 @@ def coinbase_request(
 
     timestamp = str(int(time.time()))
     message = timestamp + method.upper() + path + ""
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    # Coinbase legacy API keys have base64-encoded secrets
+    decoded_secret = base64.b64decode(api_secret)
+    signature = base64.b64encode(
+        hmac.new(
+            decoded_secret,
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("utf-8")
 
     headers = {
         "CB-ACCESS-KEY": api_key,
