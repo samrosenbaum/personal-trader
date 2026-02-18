@@ -140,12 +140,22 @@ def _build_portfolio() -> dict:
 
 def _fetch_coinbase_accounts() -> list[dict]:
     """Fetch account balances from Coinbase Advanced Trade API."""
+    api_key = os.environ.get("COINBASE_API_KEY", "")
+    api_secret = os.environ.get("COINBASE_SECRET", "")
+
+    if not api_key or not api_secret:
+        logger.error("Coinbase API keys not configured")
+        return []
+
     try:
-        data = coinbase_request("GET", "/api/v3/brokerage/accounts")
+        data = coinbase_request("GET", "/api/v3/brokerage/accounts", api_key, api_secret)
     except Exception as e:
         logger.error(f"Coinbase API call failed: {e}")
-        # Return error info for debugging
-        return [{"_error": str(e)}]
+        return []
+
+    if not isinstance(data, dict):
+        logger.error(f"Unexpected Coinbase response type: {type(data)}")
+        return []
 
     accounts = data.get("accounts", [])
     result = []
