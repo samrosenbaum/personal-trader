@@ -39,7 +39,9 @@ def _build_portfolio() -> dict:
     # 1. Fetch Coinbase accounts
     accounts = _fetch_coinbase_accounts()
 
-    if not accounts:
+    # Check for error info from the fetch
+    if not accounts or (len(accounts) == 1 and "_error" in accounts[0]):
+        error_msg = accounts[0]["_error"] if accounts and "_error" in accounts[0] else "No accounts"
         return {
             "portfolioSummary": {
                 "totalValue": 0,
@@ -50,6 +52,7 @@ def _build_portfolio() -> dict:
             },
             "holdings": [],
             "risk": _empty_risk(),
+            "_debug": error_msg,
         }
 
     # 2. Get live prices from CoinGecko
@@ -141,7 +144,8 @@ def _fetch_coinbase_accounts() -> list[dict]:
         data = coinbase_request("GET", "/api/v3/brokerage/accounts")
     except Exception as e:
         logger.error(f"Coinbase API call failed: {e}")
-        return []
+        # Return error info for debugging
+        return [{"_error": str(e)}]
 
     accounts = data.get("accounts", [])
     result = []
